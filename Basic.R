@@ -13,44 +13,53 @@ library(ggplot2)
 library(tibble)
 library(viridis)
 
-
 # ---- 2) Dados ----
 dados <- read.csv("sul_snis_municipio_agua_esgoto.csv", stringsAsFactors = FALSE)
 
 # ---- 3) LIMPEZA + HEATMAP DE MISSING VALUES ----
+
+# 🔹 3.1 - Corrigir caracteres vazios e infinitos
 dados <- dados %>%
   dplyr::mutate(across(where(is.character), ~na_if(.x, ""))) %>%
   dplyr::mutate(across(where(is.numeric), ~ifelse(is.infinite(.x), NA, .x))) %>%
   dplyr::filter(!is.na(id_municipio), !is.na(ano))
 
-# Heatmap de Missing Values por UF e Ano
-if (all(c("sigla_uf", "ano") %in% names(dados))) {
-  excluidas <- c("id_municipio", "ano", "sigla_uf")
-  num_cols <- setdiff(names(dados)[sapply(dados, is.numeric)], excluidas)
-  
-  missing_por_ano_uf <- dados %>%
-    dplyr::group_by(sigla_uf, ano) %>%
-    dplyr::summarise(
-      total_missing = sum(is.na(across(all_of(num_cols)))),
-      total_campos = n() * length(num_cols),
-      .groups = "drop"
-    ) %>%
-    dplyr::mutate(perc_missing = ifelse(total_campos > 0, 100 * total_missing / total_campos, 0))
-  
-  if (nrow(missing_por_ano_uf) > 0) {
-    ggplot(missing_por_ano_uf, aes(x = factor(ano), y = sigla_uf, fill = perc_missing)) +
-      geom_tile(color = "white") +
-      geom_text(aes(label = sprintf("%.1f", perc_missing)), color = "black", size = 3) +
-      scale_fill_viridis(option = "plasma", name = "% Missing") +
-      labs(
-        title = "Heatmap de Missing Values por Estado e Ano",
-        x = "Ano", y = "Estado"
-      ) +
-      theme_minimal(base_size = 12)
+# 🔹 Função para gerar heatmap de missing
+plot_missing_heatmap <- function(df, titulo = "Heatmap de Missing Values por Estado e Ano") {
+  if (all(c("sigla_uf", "ano") %in% names(df))) {
+    excluidas <- c("id_municipio", "ano", "sigla_uf")
+    num_cols <- setdiff(names(df)[sapply(df, is.numeric)], excluidas)
+    
+    missing_por_ano_uf <- df %>%
+      dplyr::group_by(sigla_uf, ano) %>%
+      dplyr::summarise(
+        total_missing = sum(is.na(across(all_of(num_cols)))),
+        total_campos = n() * length(num_cols),
+        .groups = "drop"
+      ) %>%
+      dplyr::mutate(perc_missing = ifelse(total_campos > 0, 100 * total_missing / total_campos, 0))
+    
+    if (nrow(missing_por_ano_uf) > 0) {
+      ggplot(missing_por_ano_uf, aes(x = factor(ano), y = sigla_uf, fill = perc_missing)) +
+        geom_tile(color = "white") +
+        geom_text(aes(label = sprintf("%.1f", perc_missing)), color = "black", size = 3) +
+        scale_fill_viridis(option = "plasma", name = "% Missing") +
+        labs(title = titulo, x = "Ano", y = "Estado") +
+        theme_minimal(base_size = 12)
+    }
   }
 }
 
-# ---- Remover variáveis com mais de 30% de missing (mantendo dependentes) ----
+# ---- 3.2 - Heatmap antes do filtro de 2006 ----
+print(plot_missing_heatmap(dados, titulo = "🔹 Heatmap (Todos os Anos)"))
+
+# ---- 3.3 - Filtrar apenas anos >= 2006 ----
+dados <- dados %>% dplyr::filter(ano >= 2006)
+
+# ---- 3.4 - Heatmap após o filtro ----
+print(plot_missing_heatmap(dados, titulo = "🔹 Heatmap (Anos ≥ 2006)"))
+
+# ---- 3.5 - Remover variáveis com mais de 30% de missing (exceto dependentes) ----
 limite_missing <- 0.3
 variaveis_dependentes <- c("populacao_atendida_agua", "populacao_atendida_esgoto")
 
@@ -62,6 +71,7 @@ if (length(variaveis_excluir) > 0) {
   print(variaveis_excluir)
   dados <- dados %>% dplyr::select(-all_of(variaveis_excluir))
 }
+
 
 # ---- 4) Estatísticas descritivas ----
 num_vars <- dados[, sapply(dados, is.numeric)]
@@ -83,31 +93,24 @@ if (ncol(num_vars) > 0) {
 }
 
 # ---- 5) CORRELAÇÕES ----
-# Usar apenas variáveis restantes (numéricas)
 dados_corr <- dados[, sapply(dados, is.numeric)]
 cols_excluir <- c("id_municipio", "ano", "sigla_uf")
 dados_corr <- dados_corr[, !(names(dados_corr) %in% cols_excluir), drop = FALSE]
 
-# Garantir que dependentes estão presentes
 vars_interesse <- c("populacao_atendida_agua", "populacao_atendida_esgoto")
 vars_faltantes <- setdiff(vars_interesse, names(dados_corr))
 if (length(vars_faltantes) > 0) {
   warning(paste("⚠️ Variáveis dependentes ausentes:", paste(vars_faltantes, collapse = ", ")))
 }
 
-# Calcular matriz de correlação
 cor_mat <- cor(dados_corr, use = "pairwise.complete.obs")
-
-# Ordenar variáveis por similaridade
 cor_dist <- as.dist(1 - abs(cor_mat))
 hc <- hclust(cor_dist)
 cor_mat <- cor_mat[hc$order, hc$order]
 
-# Converter p/ formato longo
 cor_melt <- as.data.frame(as.table(cor_mat))
 names(cor_melt) <- c("Var1", "Var2", "value")
 
-# ---- 5A) Heatmap geral ----
 ggplot(cor_melt, aes(Var2, Var1, fill = value)) +
   geom_tile(color = "white") +
   scale_fill_gradient2(
@@ -121,21 +124,17 @@ ggplot(cor_melt, aes(Var2, Var1, fill = value)) +
     panel.grid = element_blank()
   ) +
   labs(
-    title = "Mapa de Correlações (Pearson) — Variáveis com até 30% de Missing",
+    title = "Mapa de Correlações (Pearson) — Variáveis com até 30% de Missing (≥2006)",
     x = "", y = ""
   )
 
 # ---- 5B) Top 20 correlações separadas por variável dependente ----
-
 plot_top_corr <- function(data, var_ref, top_n = 20) {
-  # Remover a outra dependente manualmente
   outras_dependentes <- setdiff(c("populacao_atendida_agua", "populacao_atendida_esgoto"), var_ref)
   data_filtrada <- data[, !(names(data) %in% outras_dependentes), drop = FALSE]
   
-  # Calcular correlações
   corrs <- sapply(data_filtrada, function(x) cor(x, data_filtrada[[var_ref]], use = "pairwise.complete.obs"))
   
-  # Montar data frame ordenado
   corr_df <- tibble(
     variavel = names(corrs),
     correlacao = as.numeric(corrs)
@@ -144,7 +143,6 @@ plot_top_corr <- function(data, var_ref, top_n = 20) {
     arrange(desc(abs(correlacao))) %>%
     slice_head(n = top_n)
   
-  # Gerar gráfico
   ggplot(corr_df, aes(x = reorder(variavel, correlacao), y = correlacao, fill = correlacao)) +
     geom_col() +
     coord_flip() +
@@ -161,7 +159,6 @@ plot_top_corr <- function(data, var_ref, top_n = 20) {
     )
 }
 
-# ---- Gerar gráficos individuais ----
 if ("populacao_atendida_agua" %in% names(dados_corr)) {
   print(plot_top_corr(dados_corr, "populacao_atendida_agua", top_n = 20))
 }
@@ -169,6 +166,7 @@ if ("populacao_atendida_agua" %in% names(dados_corr)) {
 if ("populacao_atendida_esgoto" %in% names(dados_corr)) {
   print(plot_top_corr(dados_corr, "populacao_atendida_esgoto", top_n = 20))
 }
+
 
 # ---- 6) Transformações log ----
 cat("🔹 Aplicando transformação log (log1p) nas variáveis numéricas...\n")
