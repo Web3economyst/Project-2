@@ -1,0 +1,12 @@
+name: App_sul_saneamento
+title: App_sul_saneamento
+username: saneamento-sul
+account: saneamento-sul
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 16146349
+bundleId: 11218244
+url: https://saneamento-sul.shinyapps.io/App_sul_saneamento/
+version: 1
+asMultiple: FALSE
+asStatic: FALSE
