@@ -16,9 +16,10 @@ library(MASS)
 library(bslib)
 library(rlang)
 library(sandwich)
+library(glmnet)
 
 # ==============================================================================
-# TEMA
+# TEMA E CSS
 # ==============================================================================
 my_theme <- bs_theme(
   version = 5,
@@ -27,11 +28,29 @@ my_theme <- bs_theme(
   secondary = "#18bc9c",
   base_font = font_google("Roboto"),
   heading_font = font_google("Montserrat")
-)
+) %>%
+  bs_add_rules(
+    ".selectize-control.multi .selectize-input > div { 
+      display: block !important; 
+      margin: 2px 0 !important;
+      white-space: normal !important;
+      word-break: break-all !important;
+    }
+    .selectize-input { max-height: 250px; overflow-y: auto !important; }"
+  )
 
 # ==============================================================================
 # FUNÇÕES AUXILIARES
 # ==============================================================================
+fmt_pval <- function(x) {
+  if (is.null(x) || is.na(x) || is.nan(x)) return("-")
+  if (x < 2.2e-16) return("< 2.2e-16 ***")
+  if (x < 0.001) return(paste0(format(x, scientific = TRUE, digits = 4), " ***"))
+  if (x < 0.01) return(paste0(round(x, 4), " **"))
+  if (x < 0.05) return(paste0(round(x, 4), " *"))
+  return(round(x, 4))
+}
+
 cor_pvalue_matrix <- function(mat) {
   mat <- as.matrix(mat)
   n <- ncol(mat)
@@ -55,12 +74,26 @@ cor_pvalue_matrix <- function(mat) {
   return(p.mat)
 }
 
+# Cálculo CORRETO de AIC para Painel (Considerando N efeitos fixos)
 get_plm_info <- function(plm_model) {
   rss <- sum(residuals(plm_model)^2)
   n <- length(residuals(plm_model))
   k <- length(coef(plm_model))
-  aic_val <- 2 * k + n * log(rss / n)
-  bic_val <- log(n) * k + n * log(rss / n)
+  
+  # Ajuste de graus de liberdade para FE (Within)
+  args <- attr(plm_model, "args")
+  if (!is.null(args$model) && args$model == "within") {
+    n_entities <- length(unique(index(plm_model)[[1]]))
+    k_eff <- k + n_entities
+  } else {
+    k_eff <- k
+  }
+  
+  # Evita log de zero ou negativo
+  if (rss <= 0) return(c(AIC = NA, BIC = NA))
+  
+  aic_val <- n * log(rss / n) + 2 * k_eff
+  bic_val <- n * log(rss / n) + log(n) * k_eff
   return(c(AIC = aic_val, BIC = bic_val))
 }
 
@@ -69,23 +102,10 @@ clean_pt_num <- function(x) {
   if (is.na(x) || x == "" || x == "-") return(NA)
   x_clean <- gsub("\\.", "", x)
   x_clean <- gsub(",", ".", x_clean)
-  val <- suppressWarnings(as.numeric(x_clean))
-  if(is.infinite(val)) return(NA)
-  return(val)
+  return(suppressWarnings(as.numeric(x_clean)))
 }
 
-# ==============================================================================
-# CONFIGURAÇÃO
-# ==============================================================================
 GITHUB_CSV_URL <- "https://github.com/Web3economyst/Project-2/raw/refs/heads/main/database_saneamento.csv"
-
-# Lista de Códigos Padrão
-default_codes_list <- unique(c(
-  "FN002", "FN007", "FN004", "FN006", "FN008", "FN010", "FN011", "FN013", 
-  "FN014", "FN027", "FN037", "FN016", "FN020", "FN021", "FN022", "FN034", 
-  "FN023", "FN001", "FN042", "FN052", "AG006", "AG028",
-  "FN003", "FN024", "FN043", "FN053", "ES001"
-))
 
 # ==============================================================================
 # UI
@@ -97,17 +117,14 @@ ui <- page_sidebar(
   sidebar = sidebar(
     title = "Filtros Globais",
     class = "bg-light",
-    p("Filtre a base inteira."),
-    hr(),
     selectInput("global_natureza_juridica", "Natureza Jurídica:", choices = NULL, multiple = TRUE, selectize = TRUE),
     selectInput("global_estado", "Estado (UF):", choices = NULL, multiple = TRUE, selectize = TRUE),
     selectInput("global_municipio", "Município:", choices = NULL, multiple = TRUE, selectize = TRUE),
-    
     uiOutput("ui_year_slider"),
     helpText("Use o slider para restringir o período."),
     hr(),
-    div(class = "alert alert-info", style = "font-size: 0.8em;",
-        "Dica: As variáveis mantêm seus códigos originais (ex: fn002...).")
+    div(class = "alert alert-warning", style = "font-size: 0.8em;",
+        "Nota: Dados agregados por Município/Ano para viabilizar Painel.")
   ),
   
   tabsetPanel(
@@ -145,8 +162,7 @@ ui <- page_sidebar(
                           sidebarPanel(
                             width = 3,
                             h5("Configuração do Heatmap"),
-                            selectizeInput("miss_var_select", "Selecione as Variáveis:", choices = NULL, multiple = TRUE, options = list(placeholder = "Padrão: Seleção Personalizada")),
-                            helpText("Por padrão, exibe as variáveis FN/AG solicitadas.")
+                            selectizeInput("miss_var_select", "Selecione as Variáveis:", choices = NULL, multiple = TRUE, options = list(placeholder = "Padrão: Seleção Personalizada"))
                           ),
                           mainPanel(plotOutput("missing_values", height = "600px"))
                         )
@@ -161,32 +177,24 @@ ui <- page_sidebar(
              tabsetPanel(
                tabPanel("Histograma",
                         sidebarLayout(
-                          sidebarPanel(width = 3, 
-                                       selectInput("var_hist", "Variável:", choices = NULL) 
-                          ),
+                          sidebarPanel(width = 3, selectInput("var_hist", "Variável:", choices = NULL)),
                           mainPanel(plotOutput("histogram"))
                         )
                ),
                tabPanel("Tendências",
                         sidebarLayout(
-                          sidebarPanel(width = 3, 
-                                       selectInput("var_trend", "Variável Y:", choices = NULL) 
-                          ),
+                          sidebarPanel(width = 3, selectInput("var_trend", "Variável Y:", choices = NULL)),
                           mainPanel(plotOutput("trend_graph"))
                         )
                ),
-               
-               # --- ABA CORRELAÇÕES ---
                tabPanel("Correlações",
                         sidebarLayout(
                           sidebarPanel(
                             width = 3, 
                             h5("Seleção de Variáveis"),
-                            p("Adicione aqui todas as variáveis que deseja analisar (várias juntas)."),
                             selectInput("var_corr_vars", "Vars Matriz / Barras:", choices = NULL, multiple = TRUE), 
                             hr(),
                             h5("Variável Base (Foco)"),
-                            p("Selecione a variável central para o gráfico de barras."),
                             selectInput("corr_focus_var", "Variável Foco (Base):", choices = NULL) 
                           ),
                           mainPanel(
@@ -206,88 +214,160 @@ ui <- page_sidebar(
              br(),
              tabsetPanel(
                
-               tabPanel("Comparador (Auto)", 
+               # SEÇÃO 1: TESTES DE PAINEL (CORRIGIDO)
+               tabPanel("Testes de Painel (F & Hausman)", 
                         br(),
                         sidebarLayout(
                           sidebarPanel(
                             width = 3,
-                            h4("Configuração"),
-                            selectInput("comp_dep", "Variável Dependente (Y):", choices = NULL),
-                            selectInput("comp_idvs", "Candidatas a Independentes (X):", choices = NULL, multiple = TRUE),
+                            h4("Configuração do Teste"),
+                            selectInput("spec_dep", "Dependente (Y):", choices = NULL),
+                            selectInput("spec_idvs", "Independentes (X):", choices = NULL, multiple = TRUE),
                             hr(),
-                            actionButton("btn_run_comparison", "Rodar Comparativo", class = "btn-primary btn-lg", width = "100%")
+                            actionButton("btn_run_spec", "Executar Testes", class = "btn-primary", width = "100%")
                           ),
                           mainPanel(
-                            h3("Resultados (Stepwise + Painel)"),
-                            p("Nota: O comparador usa 'Município' como índice padrão."),
-                            DT::dataTableOutput("comparison_table"),
-                            br(),
-                            verbatimTextOutput("best_model_summary")
+                            h3("Resultados de Especificação"),
+                            p("Roteiro de decisão: Pooling vs Random Effects vs Fixed Effects."),
+                            uiOutput("spec_tests_results_ui")
                           )
                         )
                ),
                
-               tabPanel("Regressão Manual",
+               # SEÇÃO 2: SELEÇÃO DO MODELO (COM TRANSFORMACAO WITHIN + STEPWISE OLS)
+               tabPanel("Seleção do Modelo", 
+                        br(),
                         sidebarLayout(
                           sidebarPanel(
                             width = 3,
-                            selectInput("model_type_manual", "Tipo de Modelo:", c("Pooling (OLS)", "Fixed Effects (Within)", "Random Effects")),
+                            h4("Configuração da Seleção"),
+                            selectInput("step_model_type", "Modelo de Referência:", 
+                                        choices = c("Fixed Effects (Within)" = "within", "Random Effects" = "random", "Pooling (OLS)" = "pooling")),
+                            selectInput("step_dep", "Dependente (Y):", choices = NULL),
+                            selectInput("step_idvs", "Candidatas (X):", choices = NULL, multiple = TRUE),
                             hr(),
-                            selectInput("manual_cat_fe", "1º Efeito Fixo (Categorical Variable):", choices = NULL, selected = "municipio"),
-                            helpText("Define a variável de agrupamento (Index Individual)."),
-                            selectInput("manual_se_type", "Standard Errors:", c("Standard", "Clustered")),
-                            helpText("Clustered agrupa erros pelo 1º Efeito Fixo."),
-                            hr(),
-                            selectInput("manual_dep", "Dependente:", choices = NULL),
-                            selectInput("manual_idvs", "Independentes:", choices = NULL, multiple = TRUE)
+                            actionButton("btn_run_stepwise_adv", "Executar Stepwise", class = "btn-success", width = "100%")
                           ),
                           mainPanel(
+                            h3("Comparação de Métodos de Seleção"),
+                            div(class="alert alert-info", "Nota: Para 'Fixed Effects', o algoritmo aplica a transformação within (centragem na média) antes da seleção para garantir consistência."),
+                            DT::dataTableOutput("stepwise_results_table"),
+                            br(),
+                            uiOutput("stepwise_best_header_ui"),
+                            verbatimTextOutput("stepwise_best_summary"),
+                            
+                            # DIAGNOSTICO RESIDUOS
+                            hr(),
+                            h4("Diagnóstico de Resíduos (White Noise Check)"),
+                            p("Análise dos resíduos do modelo vencedor."),
+                            fluidRow(
+                              column(6, plotOutput("step_resid_plot", height = "300px")),
+                              column(6, plotOutput("step_qq_plot", height = "300px"))
+                            ),
+                            br(),
+                            verbatimTextOutput("step_resid_tests")
+                          )
+                        )
+               ),
+               
+               # SEÇÃO 3: LASSO
+               tabPanel("Métodos Avançados (LASSO/Net)",
+                        br(),
+                        sidebarLayout(
+                          sidebarPanel(
+                            width = 3,
+                            h4("Configuração de Seleção"),
+                            selectInput("lasso_dep", "Dependente (Y):", choices = NULL),
+                            selectInput("lasso_idvs", "Candidatas (X):", choices = NULL, multiple = TRUE),
+                            hr(),
+                            selectInput("sel_method", "Método de Seleção:", 
+                                        choices = c("LASSO", "Elastic Net", "Stability Selection")),
+                            conditionalPanel(
+                              condition = "input.sel_method == 'Elastic Net'",
+                              sliderInput("el_alpha", "Alpha:", min = 0.0, max = 1.0, value = 0.5, step = 0.1)
+                            ),
+                            conditionalPanel(
+                              condition = "input.sel_method == 'Stability Selection'",
+                              sliderInput("stab_thresh", "Threshold:", min = 0.5, max = 1.0, value = 0.6, step = 0.05),
+                              numericInput("stab_iter", "Iterações:", value = 50, min = 10, max = 200)
+                            ),
+                            hr(),
+                            checkboxInput("lasso_fe", "Aplicar 'Within Transformation'?", value = FALSE),
+                            helpText("Subtrai a média por município antes de rodar (Simula Efeitos Fixos)."),
+                            br(),
+                            actionButton("btn_run_lasso", "Executar Seleção", class = "btn-success", width = "100%")
+                          ),
+                          mainPanel(
+                            h3("Resultado da Seleção"),
+                            div(class="alert alert-info", textOutput("method_desc")),
+                            fluidRow(
+                              column(7, plotOutput("lasso_plot")),
+                              column(5, h4("Variáveis"), tableOutput("lasso_coefs_table"))
+                            )
+                          )
+                        )
+               ),
+               
+               # SEÇÃO 4: REGRESSÃO MANUAL
+               tabPanel("Regressão Manual (Comparativo)",
+                        sidebarLayout(
+                          sidebarPanel(
+                            width = 3,
+                            h5("Configuração"),
+                            selectInput("model_type_manual", "Tipo de Modelo:", c("Pooling (OLS)", "Fixed Effects (Within)", "Random Effects")),
+                            hr(),
+                            selectInput("manual_cat_fe", "1º Efeito Fixo (Index):", choices = NULL, selected = "Municipio"),
+                            selectInput("manual_se_type", "Correção de Erros:", 
+                                        choices = c("Padrão (Sem correção)" = "Standard", 
+                                                    "Clusterizado (HAC)" = "Clustered", 
+                                                    "Driscoll-Kraay (SCC)" = "Driscoll-Kraay")),
+                            helpText("Clusterizado: Corrige Autocorr. e Heteroced."),
+                            helpText("Driscoll-Kraay: Corrige Dep. Espacial e Temporal."),
+                            hr(),
+                            selectInput("manual_dep", "Dependente (Y):", choices = NULL),
+                            selectInput("manual_idvs", "Independentes (X):", choices = NULL, multiple = TRUE),
+                            hr(),
+                            div(class="alert alert-info", "Gera colunas para cada Natureza Jurídica.")
+                          ),
+                          mainPanel(
+                            h4("Resultados: Geral vs. Por Natureza Jurídica"),
                             htmlOutput("regression_table_manual"),
                             htmlOutput("manual_diagnostics")
                           )
                         )
                ),
                
-               # --- ABA DIAGNÓSTICOS PÓS-FE ---
+               # SEÇÃO 5: DIAGNÓSTICOS PÓS-FE (BLINDADO)
                tabPanel("Diagnósticos (Pós-FE)",
                         br(),
                         sidebarLayout(
                           sidebarPanel(
                             width = 3,
-                            h4("Diagnósticos de Resíduos"),
-                            p("Testes essenciais para validar o modelo de Efeitos Fixos (Within)."),
-                            hr(),
-                            selectInput("diag_cat_fe", "Efeito Fixo (ID):", choices = NULL, selected = "municipio"),
+                            selectInput("diag_cat_fe", "Efeito Fixo (ID):", choices = NULL, selected = "Municipio"),
                             selectInput("diag_dep", "Dependente (Y):", choices = NULL),
                             selectInput("diag_idvs", "Independentes (X):", choices = NULL, multiple = TRUE),
-                            hr(),
                             actionButton("btn_run_diag", "Rodar Diagnósticos", class = "btn-warning", width = "100%")
                           ),
                           mainPanel(
                             h3("Diagnósticos Essenciais Após o FE"),
+                            p("Avaliação dos resíduos para validar as hipóteses do modelo."),
                             hr(),
                             uiOutput("diag_results_ui")
                           )
                         )
                ),
                
-               # --- ABA VIF ---
-               tabPanel("Teste de Multicolinearidade (VIF)",
-                        br(),
+               # SEÇÃO 6: VIF (CORRIGIDO)
+               tabPanel("Teste VIF",
                         sidebarLayout(
                           sidebarPanel(
                             width = 3,
-                            h4("Configuração VIF"),
-                            p("Mede a inflação da variância devido à colinearidade."),
                             selectInput("vif_idvs", "Variáveis Independentes (X):", choices = NULL, multiple = TRUE),
-                            helpText("Selecione variáveis que não sejam soma uma da outra."),
-                            hr(),
                             actionButton("btn_calc_vif", "Calcular VIF", class = "btn-info", width = "100%")
                           ),
                           mainPanel(
                             h3("Fatores de Inflação da Variância (VIF)"),
-                            div(class = "alert alert-info", 
-                                "Interpretação: VIF > 10 indica multicolinearidade severa."),
+                            p("Detecta multicolinearidade. VIF > 5 ou 10 indica problema."),
                             fluidRow(
                               column(6, tableOutput("vif_result_table")),
                               column(6, plotOutput("vif_plot"))
@@ -306,419 +386,526 @@ ui <- page_sidebar(
 server <- function(input, output, session) {
   
   values <- reactiveValues(raw_df = NULL, col_names = NULL)
-  comparison_results <- reactiveVal(NULL)
-  best_model_obj <- reactiveVal(NULL)
+  step_results_data <- reactiveVal(NULL)
+  best_step_model <- reactiveVal(NULL)
+  best_method_name <- reactiveVal(NULL)
   
   # --- 1. CARREGAMENTO E PROCESSAMENTO ---
   observe({
     req(is.null(values$raw_df))
-    
     id <- showNotification("Carregando base...", duration = NULL, closeButton = FALSE)
     on.exit(removeNotification(id), add = TRUE)
     
-    raw <- tryCatch({
-      read.csv(GITHUB_CSV_URL, stringsAsFactors = FALSE, fileEncoding = "latin1", check.names = FALSE)
-    }, error = function(e) {
-      tryCatch({
-        read.csv(GITHUB_CSV_URL, stringsAsFactors = FALSE, fileEncoding = "UTF-8", check.names = FALSE)
-      }, error = function(e2) {
-        read.csv(GITHUB_CSV_URL, stringsAsFactors = FALSE, check.names = FALSE)
-      })
-    })
+    raw <- tryCatch({ read.csv(GITHUB_CSV_URL, stringsAsFactors = FALSE, fileEncoding = "latin1", check.names = FALSE) }, 
+                    error = function(e) { read.csv(GITHUB_CSV_URL, stringsAsFactors = FALSE, check.names = FALSE) })
     
     clean <- raw %>% janitor::clean_names()
-    
-    # Renomeação ESTRUTURAL
     if("municipio" %in% names(clean)) names(clean)[names(clean) == "municipio"] <- "Municipio"
     if("estado" %in% names(clean)) names(clean)[names(clean) == "estado"] <- "Sigla_UF"
     if("ano_de_referencia" %in% names(clean)) names(clean)[names(clean) == "ano_de_referencia"] <- "Ano_Ref"
     if("natureza_juridica" %in% names(clean)) names(clean)[names(clean) == "natureza_juridica"] <- "Natureza_Juridica"
     
-    cols_all <- names(clean)
-    cols_skip <- c("Municipio", "Sigla_UF", "Natureza_Juridica", "prestador", "sigla_do_prestador", "abrangencia", "tipo_de_servico")
-    cols_to_convert <- setdiff(cols_all, cols_skip)
+    cols_skip <- c("Municipio", "Sigla_UF", "Natureza_Juridica", "prestador", "sigla_do_prestador")
+    for(col in setdiff(names(clean), cols_skip)) if(is.character(clean[[col]])) clean[[col]] <- sapply(clean[[col]], clean_pt_num)
     
-    for(col in cols_to_convert) {
-      if(is.character(clean[[col]])) {
-        clean[[col]] <- sapply(clean[[col]], clean_pt_num)
-      }
-    }
+    # Cálculos automáticos
+    c2 <- names(clean)[grepl("^fn002", names(clean))][1]
+    c15 <- names(clean)[grepl("^fn015", names(clean))][1]
+    if(!is.na(c2) && !is.na(c15)) clean$Lucro_op <- clean[[c2]] - clean[[c15]]
     
-    # --- CRIAÇÃO AUTOMÁTICA DA VARIÁVEL LUCRO_OP ---
-    col_rev <- names(clean)[grepl("^fn002", names(clean))][1]
-    col_exp <- names(clean)[grepl("^fn015", names(clean))][1]
-    if(!is.na(col_rev) && !is.na(col_exp)) {
-      clean$Lucro_op <- clean[[col_rev]] - clean[[col_exp]]
-    }
-    
-    # --- CRIAÇÃO AUTOMÁTICA DA VARIÁVEL DESP_PPE (NOVA) ---
-    # desp_ppe = fn011 + fn010 + fn013
-    col_fn011 <- names(clean)[grepl("^fn011", names(clean))][1]
-    col_fn010 <- names(clean)[grepl("^fn010", names(clean))][1]
-    col_fn013 <- names(clean)[grepl("^fn013", names(clean))][1]
-    
-    if(!is.na(col_fn011) && !is.na(col_fn010) && !is.na(col_fn013)) {
-      clean$desp_ppe <- clean[[col_fn011]] + clean[[col_fn010]] + clean[[col_fn013]]
-    }
-    # -----------------------------------------------------
+    c11 <- names(clean)[grepl("^fn011", names(clean))][1]; c10 <- names(clean)[grepl("^fn010", names(clean))][1]; c13 <- names(clean)[grepl("^fn013", names(clean))][1]
+    if(!is.na(c11) && !is.na(c10) && !is.na(c13)) clean$desp_ppe <- clean[[c11]] + clean[[c10]] + clean[[c13]]
     
     values$raw_df <- clean
     values$col_names <- names(clean)
     
-    if("Natureza_Juridica" %in% names(clean)) {
-      opcoes <- sort(unique(clean$Natureza_Juridica))
-      opcoes <- opcoes[opcoes != "" & !is.na(opcoes)]
-      updateSelectInput(session, "global_natureza_juridica", choices = opcoes)
-    }
-    if("Sigla_UF" %in% names(clean)) {
-      ufs <- sort(unique(clean$Sigla_UF))
-      ufs <- ufs[ufs != "" & !is.na(ufs)]
-      updateSelectInput(session, "global_estado", choices = ufs)
-    }
-    if("Municipio" %in% names(clean)) {
-      munis <- sort(unique(clean$Municipio))
-      updateSelectInput(session, "global_municipio", choices = munis)
-    }
+    updateSelectInput(session, "global_natureza_juridica", choices = sort(unique(clean$Natureza_Juridica)))
+    updateSelectInput(session, "global_estado", choices = sort(unique(clean$Sigla_UF)))
     
     char_cols <- names(clean)[sapply(clean, function(x) is.character(x) || is.factor(x))]
     sel_def <- "Municipio"
-    if(!sel_def %in% char_cols) sel_def <- char_cols[1]
     updateSelectInput(session, "manual_cat_fe", choices = char_cols, selected = sel_def)
     updateSelectInput(session, "diag_cat_fe", choices = char_cols, selected = sel_def)
   })
   
-  # --- UI UPDATES DINÂMICOS ---
-  observeEvent(values$col_names, {
-    req(values$raw_df)
-    clean <- values$raw_df
-    
-    all_clean_names <- names(clean)
-    defaults_selected <- c()
-    if("Lucro_op" %in% all_clean_names) defaults_selected <- c("Lucro_op")
-    if("desp_ppe" %in% all_clean_names) defaults_selected <- c(defaults_selected, "desp_ppe")
-    
-    for(code in default_codes_list) {
-      code_clean <- tolower(code)
-      matches <- all_clean_names[grepl(paste0("^", code_clean), all_clean_names)]
-      if(length(matches) > 0) {
-        defaults_selected <- c(defaults_selected, matches[1])
-      }
-    }
-    defaults_selected <- unique(defaults_selected)
-    
-    nums <- names(clean)[sapply(clean, is.numeric)]
-    valid_defaults <- intersect(defaults_selected, nums)
-    if(length(valid_defaults) == 0) valid_defaults <- nums[1:min(5, length(nums))]
-    
-    def_dep <- if("Lucro_op" %in% nums) "Lucro_op" else nums[1]
-    
-    safe_select <- function(current_val, default_val) {
-      if (!is.null(current_val) && current_val %in% nums) return(current_val)
-      return(default_val)
-    }
-    safe_select_multi <- function(current_vals, default_vals) {
-      if (!is.null(current_vals)) {
-        valid_vals <- intersect(current_vals, nums)
-        if (length(valid_vals) > 0) return(valid_vals)
-      }
-      return(default_vals)
-    }
-    
-    updateSelectizeInput(session, "miss_var_select", choices = nums, selected = safe_select_multi(input$miss_var_select, valid_defaults), server = TRUE)
-    updateSelectInput(session, "comp_idvs", choices = nums, selected = safe_select_multi(input$comp_idvs, valid_defaults[1:min(length(valid_defaults), 10)]))
-    updateSelectInput(session, "manual_idvs", choices = nums, selected = safe_select_multi(input$manual_idvs, valid_defaults[1:min(length(valid_defaults), 5)]))
-    updateSelectInput(session, "diag_idvs", choices = nums, selected = safe_select_multi(input$diag_idvs, valid_defaults[1:min(length(valid_defaults), 5)]))
-    updateSelectInput(session, "var_corr_vars", choices = nums, selected = safe_select_multi(input$var_corr_vars, valid_defaults)) 
-    updateSelectInput(session, "vif_idvs", choices = nums, selected = safe_select_multi(input$vif_idvs, valid_defaults[1:min(length(valid_defaults), 5)]))
-    
-    updateSelectInput(session, "comp_dep", choices = nums, selected = safe_select(input$comp_dep, def_dep))
-    updateSelectInput(session, "manual_dep", choices = nums, selected = safe_select(input$manual_dep, def_dep))
-    updateSelectInput(session, "diag_dep", choices = nums, selected = safe_select(input$diag_dep, def_dep))
-    updateSelectInput(session, "var_hist", choices = nums, selected = safe_select(input$var_hist, def_dep))
-    updateSelectInput(session, "var_trend", choices = nums, selected = safe_select(input$var_trend, def_dep))
-    updateSelectInput(session, "corr_focus_var", choices = nums, selected = safe_select(input$corr_focus_var, valid_defaults[1]))
-  })
-  
-  observeEvent(input$global_estado, ignoreNULL = FALSE, {
+  # --- 2. DATA FILTERED ---
+  data_filtered <- reactive({
     req(values$raw_df)
     df <- values$raw_df
-    if(!is.null(input$global_estado)) {
-      df_filt <- df %>% filter(Sigla_UF %in% input$global_estado)
-      munis_disponiveis <- sort(unique(df_filt$Municipio))
-    } else {
-      munis_disponiveis <- sort(unique(df$Municipio))
+    if (!is.null(input$global_natureza_juridica)) df <- df %>% filter(Natureza_Juridica %in% input$global_natureza_juridica)
+    if (!is.null(input$global_estado)) df <- df %>% filter(Sigla_UF %in% input$global_estado)
+    if (!is.null(input$global_municipio)) df <- df %>% filter(Municipio %in% input$global_municipio)
+    if (!is.null(input$global_ano_range)) df <- df %>% filter(Ano_Ref >= input$global_ano_range[1] & Ano_Ref <= input$global_ano_range[2])
+    
+    df %>%
+      group_by(Municipio, Ano_Ref) %>%
+      summarise(across(where(is.numeric), ~sum(., na.rm = TRUE)), 
+                Natureza_Juridica = first(Natureza_Juridica), 
+                Sigla_UF = first(Sigla_UF), .groups = "drop")
+  })
+  
+  # --- 3. DEFAULTS ---
+  observeEvent(values$col_names, {
+    req(values$raw_df)
+    nums <- names(values$raw_df)[sapply(values$raw_df, is.numeric)]
+    
+    target_y <- nums[grepl("es001", nums, ignore.case = TRUE)][1]
+    if(is.na(target_y)) target_y <- "Lucro_op"
+    
+    target_x_codes <- c("fn003", "fn006", "fn008", "fn010", "fn011", "fn013", 
+                        "fn014", "fn024", "fn043", "fn053", "es028", "fn027", 
+                        "fn020", "fn039", "fn021")
+    target_x <- c()
+    for(code in target_x_codes) {
+      found <- nums[grepl(code, nums, ignore.case = TRUE)][1]
+      if(!is.na(found)) target_x <- c(target_x, found)
     }
-    updateSelectInput(session, "global_municipio", choices = munis_disponiveis, selected = intersect(input$global_municipio, munis_disponiveis))
+    if(length(target_x) == 0) target_x <- nums[1:5]
+    
+    updateSelectizeInput(session, "miss_var_select", choices = nums, selected = target_x[1:5])
+    updateSelectInput(session, "spec_dep", choices = nums, selected = target_y)
+    updateSelectInput(session, "spec_idvs", choices = nums, selected = target_x[1:min(length(target_x), 5)])
+    updateSelectInput(session, "step_dep", choices = nums, selected = target_y)
+    updateSelectInput(session, "step_idvs", choices = nums, selected = target_x)
+    updateSelectInput(session, "manual_dep", choices = nums, selected = target_y)
+    updateSelectInput(session, "manual_idvs", choices = nums, selected = target_x)
+    updateSelectInput(session, "lasso_dep", choices = nums, selected = target_y)
+    updateSelectInput(session, "lasso_idvs", choices = nums, selected = target_x)
+    updateSelectInput(session, "diag_dep", choices = nums, selected = target_y)
+    updateSelectInput(session, "diag_idvs", choices = nums, selected = target_x[1:min(length(target_x), 5)])
+    updateSelectInput(session, "vif_idvs", choices = nums, selected = target_x[1:min(length(target_x), 5)])
+    updateSelectInput(session, "var_hist", choices = nums, selected = target_y)
+    updateSelectInput(session, "var_trend", choices = nums, selected = target_y)
+    updateSelectInput(session, "var_corr_vars", choices = nums, selected = target_x)
+    updateSelectInput(session, "corr_focus_var", choices = nums, selected = target_y)
   })
   
   output$ui_year_slider <- renderUI({
     req(values$raw_df)
-    if("Ano_Ref" %in% names(values$raw_df)) {
-      anos <- na.omit(values$raw_df$Ano_Ref)
-      min_ano <- min(anos)
-      max_ano <- max(anos)
-      sliderInput("global_ano_range", "Período (Anos):", min = min_ano, max = max_ano, value = c(min_ano, max_ano), step = 1, sep = "")
-    } else {
-      p("Coluna 'Ano_Ref' não encontrada.")
-    }
-  })
-  
-  data_filtered <- reactive({
-    req(values$raw_df)
-    df <- values$raw_df
-    if (!is.null(input$global_natureza_juridica)) if("Natureza_Juridica" %in% names(df)) df <- df %>% filter(Natureza_Juridica %in% input$global_natureza_juridica)
-    if (!is.null(input$global_estado)) if("Sigla_UF" %in% names(df)) df <- df %>% filter(Sigla_UF %in% input$global_estado)
-    if (!is.null(input$global_municipio)) if("Municipio" %in% names(df)) df <- df %>% filter(Municipio %in% input$global_municipio)
-    if (!is.null(input$global_ano_range) && "Ano_Ref" %in% names(df)) df <- df %>% filter(Ano_Ref >= input$global_ano_range[1] & Ano_Ref <= input$global_ano_range[2])
-    df
+    anos <- na.omit(values$raw_df$Ano_Ref)
+    sliderInput("global_ano_range", "Período:", min(anos), max(anos), value = range(anos), step = 1, sep="")
   })
   
   observeEvent(input$btn_create_var, {
     req(input$new_var_name, input$new_var_formula, values$raw_df)
     tryCatch({
-      new_data <- values$raw_df %>%
-        mutate(!!sym(input$new_var_name) := !!parse_expr(input$new_var_formula))
-      if(sum(is.infinite(new_data[[input$new_var_name]])) > 0) showNotification("Aviso: Infinitos gerados.", type = "warning")
+      new_data <- values$raw_df %>% mutate(!!sym(input$new_var_name) := !!parse_expr(input$new_var_formula))
       values$raw_df <- new_data
       values$col_names <- names(new_data)
-      showNotification(paste("Variável", input$new_var_name, "criada!"), type = "message")
+      showNotification("Variável criada!", type = "message")
     }, error = function(e) showNotification(paste("Erro:", e$message), type = "error"))
   })
   
-  # --- OUTPUTS ---
+  # --- OUTPUTS TAB 1, 2, 3 ---
   output$list_vars_available <- renderPrint({ req(values$col_names); print(values$col_names) })
-  output$full_data <- DT::renderDataTable({ req(data_filtered()); data_filtered() }, options = list(scrollX = TRUE, pageLength = 10))
-  
-  output$missing_values <- renderPlot({
-    req(data_filtered())
-    df <- data_filtered()
-    if(nrow(df) == 0) return(NULL)
-    validate(need(!is.null(input$miss_var_select), "Carregando variáveis..."))
-    vars_plot <- input$miss_var_select
-    if(length(vars_plot) == 0) return(NULL)
-    df_na <- df %>% dplyr::select(any_of(vars_plot), Ano_Ref)
-    if ("Ano_Ref" %in% names(df_na)) {
-      df_na_long <- df_na %>% group_by(Ano_Ref) %>% summarise(across(everything(), ~sum(is.na(.)) / n() * 100)) %>% pivot_longer(-Ano_Ref, names_to = "Variavel", values_to = "Porcentagem_NA")
-      ggplot(df_na_long, aes(x = as.factor(Ano_Ref), y = Variavel, fill = Porcentagem_NA)) +
-        geom_tile(color = "white") + geom_text(aes(label = round(Porcentagem_NA, 1)), color = ifelse(df_na_long$Porcentagem_NA > 50, "white", "black"), size = 3) +
-        scale_fill_gradient(low = "#d4edda", high = "#e74c3c", limits = c(0, 100)) + theme_minimal() + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + labs(title = "Heatmap de Missings (% NA)", x = "Ano", y = NULL)
-    }
-  })
-  
-  output$bar_chart <- renderPlot({
-    req(data_filtered())
-    if ("Sigla_UF" %in% names(data_filtered())) {
-      data_filtered() %>% count(Sigla_UF) %>% ggplot(aes(x = reorder(Sigla_UF, -n), y = n)) + geom_col(fill = "#2c3e50") + theme_minimal() + labs(title = "Observações por UF", x = "Estado", y = "Contagem")
-    }
-  })
+  output$full_data <- DT::renderDataTable({ req(data_filtered()); data_filtered() }, options = list(scrollX = TRUE))
   
   output$descriptive_stats <- renderUI({
     req(data_filtered())
     df_desc <- data_filtered() %>% dplyr::select(where(is.numeric))
-    if(ncol(df_desc) > 0 && nrow(df_desc) > 0) {
-      tryCatch({ HTML(prepare_descriptive_table(df_desc)$kable_ret) }, error = function(e) HTML("Erro ao gerar tabela."))
-    } else { HTML("Sem dados numéricos.") }
-  })
-  
-  output$histogram <- renderPlot({
-    req(data_filtered())
-    validate(need(input$var_hist, "Carregando..."), need(input$var_hist %in% names(data_filtered()), "Variável não encontrada."))
-    val <- as.numeric(data_filtered()[[input$var_hist]])
-    hist(val, col = "#18bc9c", border = "white", main = paste("Distr.", input$var_hist), xlab = input$var_hist, breaks = 30)
-  })
-  
-  output$trend_graph <- renderPlot({
-    req(data_filtered())
-    validate(need(input$var_trend, "Carregando..."), need(input$var_trend %in% names(data_filtered()), "Variável não encontrada."))
-    df <- data_filtered()
-    if("Ano_Ref" %in% names(df)) {
-      df %>% group_by(Ano_Ref) %>% summarise(M = mean(.data[[input$var_trend]], na.rm=T)) %>%
-        ggplot(aes(x=Ano_Ref, y=M)) + geom_line(color="#2c3e50", linewidth=1.2) + geom_point(size=3, color="#18bc9c") +
-        theme_minimal() + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + labs(title = "Média Anual", y = input$var_trend)
+    if(ncol(df_desc) > 0) {
+      st <- do.call(data.frame, 
+                    list(Mean = apply(df_desc, 2, mean, na.rm=TRUE),
+                         SD = apply(df_desc, 2, sd, na.rm=TRUE),
+                         Min = apply(df_desc, 2, min, na.rm=TRUE),
+                         Max = apply(df_desc, 2, max, na.rm=TRUE)))
+      kable(st, format = "html", digits = 2) %>% kable_styling("striped") %>% HTML()
     }
   })
   
-  output$correlation_plot <- renderPlotly({
+  output$missing_values <- renderPlot({
+    req(values$raw_df, input$miss_var_select)
+    df_raw_filt <- values$raw_df
+    if (!is.null(input$global_natureza_juridica)) df_raw_filt <- df_raw_filt %>% filter(Natureza_Juridica %in% input$global_natureza_juridica)
+    if (!is.null(input$global_estado)) df_raw_filt <- df_raw_filt %>% filter(Sigla_UF %in% input$global_estado)
+    if (!is.null(input$global_municipio)) df_raw_filt <- df_raw_filt %>% filter(Municipio %in% input$global_municipio)
+    if (!is.null(input$global_ano_range)) df_raw_filt <- df_raw_filt %>% filter(Ano_Ref >= input$global_ano_range[1] & Ano_Ref <= input$global_ano_range[2])
+    
+    df <- df_raw_filt %>% dplyr::select(any_of(input$miss_var_select), Ano_Ref)
+    df_long <- df %>% group_by(Ano_Ref) %>% summarise(across(everything(), ~sum(is.na(.))/n()*100)) %>% pivot_longer(-Ano_Ref)
+    
+    ggplot(df_long, aes(x=factor(Ano_Ref), y=name, fill=value)) + 
+      geom_tile(color = "white", linewidth = 0.5) + # Borda
+      geom_text(aes(label = paste0(round(value, 0), "%")), size = 3.5, fontface = "bold",
+                color = ifelse(df_long$value > 50, "white", "black")) + 
+      scale_fill_gradient(low = "#ecf0f1", high = "#c0392b", limits = c(0, 100), name = "% Missing") +
+      labs(title = "Mapa de Dados Faltantes (Por Ano)", x = NULL, y = NULL) +
+      theme_minimal() + 
+      theme(axis.text.x = element_text(angle = 0, face = "bold"),
+            panel.grid = element_blank())
+  })
+  
+  output$bar_chart <- renderPlot({
     req(data_filtered())
-    validate(need(length(input$var_corr_vars) > 1, "Selecione pelo menos 2 variáveis."))
+    data_filtered() %>% count(Sigla_UF) %>% ggplot(aes(x = reorder(Sigla_UF, -n), y = n)) + geom_col(fill = "#2c3e50") + theme_minimal()
+  })
+  
+  output$histogram <- renderPlot({
+    req(data_filtered(), input$var_hist)
+    ggplot(data_filtered(), aes(x = .data[[input$var_hist]])) + geom_histogram(fill = "#18bc9c", bins=30) + theme_minimal()
+  })
+  
+  output$trend_graph <- renderPlot({
+    req(data_filtered(), input$var_trend)
+    df <- data_filtered() %>% group_by(Ano_Ref) %>% summarise(M = mean(.data[[input$var_trend]], na.rm=T))
+    ggplot(df, aes(x=Ano_Ref, y=M)) + geom_line(linewidth=1) + geom_point() + theme_minimal()
+  })
+  
+  output$correlation_plot <- renderPlotly({
+    req(data_filtered(), input$var_corr_vars)
     df_sel <- data_filtered() %>% dplyr::select(any_of(input$var_corr_vars)) %>% dplyr::select(where(is.numeric)) %>% na.omit()
-    if(ncol(df_sel) < 2 || nrow(df_sel) < 5) return(NULL)
+    if(ncol(df_sel) < 2) return(NULL)
     cor_mat <- cor(df_sel)
     p_mat <- cor_pvalue_matrix(df_sel)
     cor_df <- as.data.frame(cor_mat) %>% tibble::rownames_to_column("Var1") %>% pivot_longer(-Var1, names_to = "Var2", values_to = "Cor")
     p_df <- as.data.frame(p_mat) %>% tibble::rownames_to_column("Var1") %>% pivot_longer(-Var1, names_to = "Var2", values_to = "Pval")
     plot_data <- left_join(cor_df, p_df, by = c("Var1", "Var2")) %>% mutate(Txt = paste0("R: ", round(Cor, 3), "<br>P: ", scales::scientific(Pval)))
-    gg <- ggplot(plot_data, aes(x = Var1, y = Var2, fill = Cor, text = Txt)) + geom_tile(color = "white") + scale_fill_gradient2(limit = c(-1, 1), low="#e74c3c", mid="white", high="#2c3e50") + theme_minimal() + coord_fixed() + theme(axis.text.x = element_text(angle=45, hjust=1))
+    gg <- ggplot(plot_data, aes(x=Var1, y=Var2, fill=Cor, text=Txt)) + geom_tile() + scale_fill_gradient2(limit=c(-1,1)) + theme_minimal() + coord_fixed() + theme(axis.text.x = element_text(angle=45))
     ggplotly(gg, tooltip = "text")
   })
   
   output$correlation_bar_plot <- renderPlotly({
-    req(data_filtered())
-    df <- data_filtered()
-    df_num <- df %>% dplyr::select(where(is.numeric))
-    validate(need(input$corr_focus_var, "Carregando..."), need(input$corr_focus_var %in% names(df_num), "Variável foco não encontrada."))
-    if(var(df_num[[input$corr_focus_var]], na.rm = TRUE) == 0) return(plotly_empty() %>% layout(title = "Foco constante."))
-    vars_to_compare <- input$var_corr_vars
-    if(is.null(vars_to_compare)) vars_to_compare <- names(df_num)
-    vars_to_compare <- setdiff(vars_to_compare, input$corr_focus_var)
-    vars_to_compare <- intersect(vars_to_compare, names(df_num))
-    if(length(vars_to_compare) == 0) return(NULL)
-    cor_vals <- numeric(); var_names <- character()
-    for(v in vars_to_compare) {
-      if(var(df_num[[v]], na.rm=TRUE) > 0) {
-        val <- cor(df_num[[input$corr_focus_var]], df_num[[v]], use = "pairwise.complete.obs")
-        if(!is.na(val)) { cor_vals <- c(cor_vals, val); var_names <- c(var_names, v) }
-      }
-    }
-    if(length(cor_vals) == 0) return(plotly_empty())
-    plot_data <- data.frame(Variavel = var_names, Correlacao = cor_vals) %>% arrange(desc(Correlacao))
-    if(nrow(plot_data) > 30) plot_data <- plot_data %>% mutate(abs_corr = abs(Correlacao)) %>% slice_max(abs_corr, n = 30)
-    gg <- ggplot(plot_data, aes(x = reorder(Variavel, Correlacao), y = Correlacao, fill = Correlacao)) + geom_col() + coord_flip() + scale_fill_gradient2(low = "#e74c3c", mid = "white", high = "#18bc9c", limits = c(-1, 1)) + theme_minimal() + labs(title = paste("Correlação com:", input$corr_focus_var), x = NULL, y = "Coeficiente de Pearson")
+    req(data_filtered(), input$corr_focus_var)
+    df_num <- data_filtered() %>% dplyr::select(where(is.numeric))
+    if(!input$corr_focus_var %in% names(df_num)) return(NULL)
+    vars <- setdiff(input$var_corr_vars, input$corr_focus_var)
+    if(length(vars) == 0) return(NULL)
+    cors <- sapply(vars, function(v) cor(df_num[[input$corr_focus_var]], df_num[[v]], use="pairwise.complete.obs"))
+    plot_data <- data.frame(Var=names(cors), Cor=cors)
+    gg <- ggplot(plot_data, aes(x=reorder(Var, Cor), y=Cor, fill=Cor)) + geom_col() + coord_flip() + scale_fill_gradient2(limit=c(-1,1)) + theme_minimal()
     ggplotly(gg)
   })
   
-  output$regression_table_manual <- renderUI({
-    req(input$manual_dep, input$manual_idvs, input$manual_cat_fe, data_filtered())
-    cols_to_use <- unique(c("Ano_Ref", input$manual_cat_fe, input$manual_dep, input$manual_idvs))
-    if(!all(cols_to_use %in% names(data_filtered()))) return(HTML(paste("<div class='alert alert-danger'>Erro: Variáveis não encontradas.</div>")))
-    df_reg <- data_filtered() %>% dplyr::select(all_of(cols_to_use))
-    df_reg[sapply(df_reg, is.infinite)] <- NA
-    df_reg <- na.omit(df_reg)
-    df_reg <- df_reg %>% group_by(across(all_of(c(input$manual_cat_fe, "Ano_Ref")))) %>% summarise(across(everything(), sum, na.rm=TRUE), .groups="drop")
-    validate(need(nrow(df_reg) > 10, "Dados insuficientes."), need(length(unique(df_reg$Ano_Ref)) > 1, "Necessário mais de 1 ano."), need(length(unique(df_reg[[input$manual_cat_fe]])) > 0, "Categórica vazia."))
-    for(var in input$manual_idvs) if(var(df_reg[[var]]) == 0) return(HTML(paste0("<div class='alert alert-warning'>Erro: Variável '", var, "' é constante. Remova-a.</div>")))
-    
-    pdata <- pdata.frame(df_reg, index = c(input$manual_cat_fe, "Ano_Ref"))
-    f <- as.formula(paste(input$manual_dep, "~", paste(input$manual_idvs, collapse = "+")))
-    result_html <- tryCatch({
-      mod <- switch(input$model_type_manual,
-                    "Pooling (OLS)" = plm(f, pdata, model="pooling"),
-                    "Fixed Effects (Within)" = plm(f, pdata, model="within"),
-                    "Random Effects" = plm(f, pdata, model="random"))
-      se_list <- NULL
-      if(input$manual_se_type == "Clustered") { cov_clus <- vcovHC(mod, type = "HC1", cluster = "group"); se_list <- list(sqrt(diag(cov_clus))) }
-      paste(capture.output(stargazer(mod, type="html", header=FALSE, se = se_list, notes = paste("SE:", input$manual_se_type))), collapse="\n")
-    }, error = function(e) paste("<div class='alert alert-danger'>Erro Estimação:<br>", e$message, "</div>"))
-    HTML(result_html)
-  })
+  # --- OUTPUTS TAB 4 ---
   
-  output$manual_diagnostics <- renderUI({
-    req(input$manual_dep, data_filtered())
-    if(input$model_type_manual == "Pooling (OLS)") return(NULL)
-    HTML("<div class='alert alert-warning'>Diagnósticos disponíveis no comparador automático.</div>")
-  })
-  
-  # --- DIAGNÓSTICOS PÓS-FE ---
-  diag_results <- eventReactive(input$btn_run_diag, {
-    req(input$diag_dep, input$diag_idvs, input$diag_cat_fe, data_filtered())
-    cols <- unique(c("Ano_Ref", input$diag_cat_fe, input$diag_dep, input$diag_idvs))
-    df_d <- data_filtered() %>% dplyr::select(all_of(cols))
-    df_d[sapply(df_d, is.infinite)] <- NA
-    df_d <- na.omit(df_d)
-    df_d <- df_d %>% group_by(across(all_of(c(input$diag_cat_fe, "Ano_Ref")))) %>% summarise(across(everything(), sum, na.rm=TRUE), .groups="drop")
-    if(nrow(df_d) < 10) return(list(error = "Dados insuficientes."))
-    pdata <- pdata.frame(df_d, index = c(input$diag_cat_fe, "Ano_Ref"))
-    f <- as.formula(paste(input$diag_dep, "~", paste(input$diag_idvs, collapse = "+")))
-    tryCatch({
-      mod_fe <- plm(f, data = pdata, model = "within")
-      mod_pool <- plm(f, data = pdata, model = "pooling")
+  # 1. Testes de Painel (CORRIGIDO: Hausman RE vs FE)
+  output$spec_tests_results_ui <- renderUI({
+    input$btn_run_spec
+    isolate({
+      req(input$spec_dep, input$spec_idvs)
+      df <- data_filtered() %>% dplyr::select(Municipio, Ano_Ref, all_of(input$spec_dep), all_of(input$spec_idvs)) %>% na.omit()
+      df <- df %>% dplyr::select(where(~is.numeric(.) && var(.) > 0), Municipio, Ano_Ref)
+      if(ncol(df) < 3) return(div(class="alert alert-danger", "Erro: Variáveis constantes selecionadas."))
       
-      f_test <- tryCatch(pFtest(mod_fe, mod_pool), error = function(e) list(statistic=NA, p.value=NA, method="Erro no teste F"))
-      ar_test <- tryCatch(pwartest(mod_fe), error = function(e) list(statistic=NA, p.value=NA, method="Erro no teste AR"))
-      bp_test <- tryCatch(bptest(mod_fe), error = function(e) list(statistic=NA, p.value=NA, method="Erro no teste BP"))
-      cd_test <- tryCatch(pcdtest(mod_fe, test = "cd"), error = function(e) list(statistic=NA, p.value=NA, method="Erro no teste CD"))
+      pdata <- pdata.frame(df, index = c("Municipio", "Ano_Ref"))
+      form <- as.formula(paste(input$spec_dep, "~", paste(input$spec_idvs, collapse = "+")))
       
-      list(error = NULL, f_test = f_test, ar = ar_test, bp = bp_test, cd = cd_test)
-    }, error = function(e) list(error = e$message))
-  })
-  
-  output$diag_results_ui <- renderUI({
-    res <- diag_results()
-    if(is.null(res)) return(NULL)
-    if(!is.null(res$error)) return(HTML(paste("<div class='alert alert-danger'>Erro:", res$error, "</div>")))
-    fmt_pval <- function(p) { if(is.na(p)) return("-"); if(p < 0.001) return("< 0.001 ***"); if(p < 0.01) return(paste(round(p,4), "**")); if(p < 0.05) return(paste(round(p,4), "*")); return(round(p,4)) }
-    div(
-      h4("1. Teste F para Efeitos Individuais (Chow)"), p(paste("Estatística:", round(res$f_test$statistic, 3))), p(paste("P-Valor:", fmt_pval(res$f_test$p.value))), p(if(!is.na(res$f_test$p.value) && res$f_test$p.value < 0.05) "Conclusão: Rejeita H0 (Efeitos Fixos são necessários)." else "Conclusão: Não rejeita H0 (OLS é suficiente)."), hr(),
-      h4("2. Autocorrelação (Wooldridge test)"), p(paste("Estatística:", round(res$ar$statistic, 3))), p(paste("P-Valor:", fmt_pval(res$ar$p.value))), p(if(!is.na(res$ar$p.value) && res$ar$p.value < 0.05) "Conclusão: Rejeita H0 (Existe autocorrelação serial)." else "Conclusão: Não rejeita H0 (Sem evidência de autocorrelação)."), hr(),
-      h4("3. Heterocedasticidade (Breusch-Pagan test)"), p(paste("Estatística:", round(res$bp$statistic, 3))), p(paste("P-Valor:", fmt_pval(res$bp$p.value))), p(if(!is.na(res$bp$p.value) && res$bp$p.value < 0.05) "Conclusão: Rejeita H0 (Heterocedasticidade presente)." else "Conclusão: Homocedasticidade."), hr(),
-      h4("4. Dependência Seccional (Pesaran CD test)"), p(paste("Estatística:", round(res$cd$statistic, 3))), p(paste("P-Valor:", fmt_pval(res$cd$p.value))), p(if(!is.na(res$cd$p.value) && res$cd$p.value < 0.05) "Conclusão: Rejeita H0 (Dependência entre unidades/municípios)." else "Conclusão: Independência seccional.")
-    )
-  })
-  
-  observeEvent(input$btn_run_comparison, {
-    req(input$comp_dep, input$comp_idvs, data_filtered())
-    withProgress(message = 'Rodando Comparativo...', value = 0, {
-      cols_use <- c("Municipio", "Ano_Ref", input$comp_dep, input$comp_idvs)
-      df_reg <- data_filtered() %>% dplyr::select(all_of(cols_use))
-      df_reg[sapply(df_reg, is.infinite)] <- NA
-      df_reg <- na.omit(df_reg)
-      df_reg <- df_reg %>% group_by(Municipio, Ano_Ref) %>% summarise(across(everything(), sum, na.rm=TRUE), .groups="drop")
-      if(nrow(df_reg) < 10) { showNotification("Dados insuficientes.", type="error"); return(NULL) }
-      pdata <- pdata.frame(df_reg, index = c("Municipio", "Ano_Ref"))
-      form_full <- as.formula(paste(input$comp_dep, "~", paste(input$comp_idvs, collapse = "+")))
-      ols_full <- lm(form_full, data = df_reg)
-      ols_null <- lm(as.formula(paste(input$comp_dep, "~ 1")), data = df_reg)
-      results_list <- list(); counter <- 1
-      for (dir in c("forward", "backward", "both")) {
-        incProgress(1/4, detail = dir)
-        model_start <- if(dir == "backward") ols_full else ols_null
-        step_res <- stepAIC(model_start, scope = list(lower=ols_null, upper=ols_full), direction = dir, trace = 0)
-        vars_selected <- names(coef(step_res))[-1]
-        if(length(vars_selected) == 0) vars_selected <- "1"
-        f_final <- as.formula(paste(input$comp_dep, "~", paste(vars_selected, collapse = "+")))
-        mod_fe <- tryCatch(plm(f_final, data = pdata, model = "within"), error = function(e) NULL)
-        mod_re <- tryCatch(plm(f_final, data = pdata, model = "random"), error = function(e) NULL)
-        mod_pool <- tryCatch(plm(f_final, data = pdata, model = "pooling"), error = function(e) NULL)
-        extract_m <- function(mod, type, ref1=NULL, ref2=NULL) {
-          if(is.null(mod)) return(NULL)
-          info <- get_plm_info(mod)
-          fp <- NA; hp <- NA
-          if(type == "Fixed Effects" && !is.null(ref1)) { t <- tryCatch(pFtest(mod, ref1), error=function(e) NULL); if(!is.null(t)) fp <- t$p.value }
-          if(type == "Random Effects" && !is.null(ref2)) { t <- tryCatch(phtest(ref2, mod), error=function(e) NULL); if(!is.null(t)) hp <- t$p.value }
-          data.frame(Dir = dir, Modelo = type, Vars = length(vars_selected), AIC = round(info["AIC"], 2), BIC = round(info["BIC"], 2), Adj_R2 = round(summary(mod)$r.squared["adjrsq"], 4), P_F_Test = ifelse(is.na(fp), "-", format.pval(fp, digits=3)), P_Hausman = ifelse(is.na(hp), "-", format.pval(hp, digits=3)), Formula = paste(vars_selected, collapse=" + "))
-        }
-        results_list[[counter]] <- extract_m(mod_fe, "Fixed Effects", ref1=mod_pool); counter <- counter + 1
-        results_list[[counter]] <- extract_m(mod_re, "Random Effects", ref2=mod_fe); counter <- counter + 1
-      }
-      final_df <- do.call(rbind, results_list)
-      if(!is.null(final_df)) {
-        final_df <- final_df[order(final_df$AIC), ]
-        comparison_results(final_df)
-        best_row <- final_df[1, ]
-        best_f <- as.formula(paste(input$comp_dep, "~", best_row$Formula))
-        best_t <- ifelse(best_row$Modelo == "Fixed Effects", "within", "random")
-        best_model_obj(plm(best_f, data = pdata, model = best_t))
-      }
+      tryCatch({
+        mod_fe <- plm(form, data = pdata, model = "within")
+        mod_re <- plm(form, data = pdata, model = "random")
+        mod_pool <- plm(form, data = pdata, model = "pooling")
+        
+        f_t <- pFtest(mod_fe, mod_pool)
+        h_t <- phtest(mod_re, mod_fe) # CORRIGIDO: RE vs FE
+        
+        tagList(
+          h4("Teste F (Pooled vs FE)"), p(paste("P-valor:", fmt_pval(f_t$p.value))),
+          p(if(f_t$p.value < 0.05) "Rejeita H0: Use Efeitos Fixos." else "Não Rejeita H0: Use Pooling."),
+          hr(),
+          h4("Teste Hausman (RE vs FE)"), p(paste("P-valor:", fmt_pval(h_t$p.value))),
+          p(if(h_t$p.value < 0.05) "Rejeita H0 (RE Inconsistente): Use Efeitos Fixos (Within)." else "Não Rejeita H0: Use Efeitos Aleatórios (Eficiente).")
+        )
+      }, error = function(e) div(class="alert alert-danger", paste("Erro:", e$message)))
     })
   })
   
-  output$comparison_table <- DT::renderDataTable({ req(comparison_results()); datatable(comparison_results(), selection = "single", options = list(pageLength = 5)) }, server = FALSE)
-  output$best_model_summary <- renderPrint({ req(best_model_obj()); summary(best_model_obj()) })
-  
-  vif_results <- eventReactive(input$btn_calc_vif, {
-    req(input$vif_idvs, data_filtered())
-    if(length(input$vif_idvs) < 2) { showNotification("Selecione ao menos 2 variáveis.", type="error"); return(NULL) }
-    df_vif <- data_filtered() %>% dplyr::select(all_of(input$vif_idvs))
-    df_vif[sapply(df_vif, is.infinite)] <- NA
-    df_vif <- na.omit(df_vif)
-    df_vif <- df_vif[, sapply(df_vif, function(x) var(x) > 0)]
-    if(ncol(df_vif) < 2) { showNotification("Menos de 2 variáveis com variância > 0.", type="error"); return(NULL) }
-    if(nrow(df_vif) < ncol(df_vif) + 2) { showNotification("Dados insuficientes para VIF.", type="error"); return(NULL) }
-    tryCatch({
-      form <- as.formula(paste("rnorm(nrow(df_vif)) ~", paste(names(df_vif), collapse = "+")))
-      mod <- lm(form, data = df_vif)
-      aliases <- alias(mod)$Complete
-      if(!is.null(aliases)) { showNotification(paste("Colinearidade perfeita detectada.", paste(rownames(aliases), collapse=", ")), type="error"); return(NULL) }
-      vif_vals <- car::vif(mod)
-      if(is.matrix(vif_vals)) vif_vals <- vif_vals[,1]
-      data.frame(Variavel = names(vif_vals), VIF = as.numeric(vif_vals)) %>% arrange(desc(VIF))
-    }, error = function(e) { showNotification(paste("Erro VIF:", e$message), type="error"); NULL })
+  # 2. Seleção do Modelo (Stepwise - COM LOGICA WITHIN)
+  observeEvent(input$btn_run_stepwise_adv, {
+    req(input$step_dep, input$step_idvs)
+    
+    df <- data_filtered() %>%
+      dplyr::select(Municipio, Ano_Ref, all_of(input$step_dep), all_of(input$step_idvs)) %>%
+      na.omit()
+    
+    # TRATAMENTO DE WITHIN (DEMEANING) ANTES DO STEPWISE
+    if (input$step_model_type == "within") {
+      df_step <- df %>%
+        group_by(Municipio) %>%
+        mutate(across(all_of(c(input$step_dep, input$step_idvs)), ~ scale(., scale = FALSE))) %>%
+        ungroup()
+    } else {
+      df_step <- df
+    }
+    
+    # Modelos OLS para Stepwise
+    null_model <- lm(as.formula(paste(input$step_dep, "~ 1")), data = df_step)
+    full_model <- lm(as.formula(paste(input$step_dep, "~", paste(input$step_idvs, collapse = "+"))), data = df_step)
+    
+    directions <- c("forward", "backward", "both")
+    results_list <- list()
+    best_aic <- Inf
+    best_mod <- NULL
+    best_name <- ""
+    
+    # Dados para painel final
+    pdata <- pdata.frame(df, index = c("Municipio", "Ano_Ref"))
+    
+    withProgress(message = "Calculando Stepwise...", {
+      for (dir in directions) {
+        incProgress(1/3, detail = dir)
+        
+        start_mod <- if (dir == "forward") null_model else full_model
+        
+        step_res <- stepAIC(start_mod, scope = list(lower = null_model, upper = full_model), direction = dir, trace = FALSE)
+        
+        final_vars <- names(coef(step_res))[-1]
+        if (length(final_vars) == 0) next
+        
+        final_form <- as.formula(paste(input$step_dep, "~", paste(final_vars, collapse = "+")))
+        
+        # Estima modelo final correto
+        mod_p <- tryCatch(
+          plm(final_form, data = pdata, model = input$step_model_type),
+          error = function(e) NULL
+        )
+        
+        if (!is.null(mod_p)) {
+          info <- get_plm_info(mod_p)
+          
+          results_list[[dir]] <- data.frame(
+            Metodo = dir,
+            AIC = round(info["AIC"], 2),
+            BIC = round(info["BIC"], 2),
+            Variaveis = paste(final_vars, collapse = " + ")
+          )
+          
+          if (info["AIC"] < best_aic) {
+            best_aic <- info["AIC"]
+            best_mod <- mod_p
+            best_name <- dir
+          }
+        }
+      }
+    })
+    
+    if (length(results_list) > 0) {
+      step_results_data(do.call(rbind, results_list))
+      best_step_model(best_mod)
+      best_method_name(best_name)
+    }
   })
-  output$vif_result_table <- renderTable({ req(vif_results()); vif_results() })
-  output$vif_plot <- renderPlot({
-    req(vif_results())
-    df <- vif_results()
-    ggplot(df, aes(x = reorder(Variavel, VIF), y = VIF, fill = VIF > 10)) + geom_col() + geom_hline(yintercept = 10, linetype="dashed", color="red") + coord_flip() + scale_fill_manual(values = c("TRUE"="#e74c3c", "FALSE"="#18bc9c"), name = "Crítico (>10)") + theme_minimal() + labs(title = "VIF por Variável", x = NULL, y = "VIF")
+  
+  output$stepwise_results_table <- DT::renderDataTable({ req(step_results_data()); datatable(step_results_data(), options = list(dom = 't', scrollX = TRUE)) })
+  
+  output$stepwise_best_header_ui <- renderUI({
+    req(best_method_name())
+    div(class = "alert alert-success", style = "text-align: center; font-weight: bold; font-size: 1.1em;",
+        paste("MODELO VENCEDOR: ", toupper(best_method_name())))
+  })
+  
+  output$stepwise_best_summary <- renderPrint({ req(best_step_model()); summary(best_step_model()) })
+  
+  # --- OUTPUTS DE RESÍDUOS PARA STEPWISE ---
+  output$step_resid_plot <- renderPlot({
+    req(best_step_model())
+    mod <- best_step_model()
+    df_r <- data.frame(Fitted = as.numeric(fitted(mod)), Resid = as.numeric(resid(mod)))
+    ggplot(df_r, aes(x=Fitted, y=Resid)) + 
+      geom_point(alpha=0.5, color="#2c3e50") +
+      geom_hline(yintercept=0, color="red", linetype="dashed") +
+      labs(title="Resíduos vs Valores Ajustados", subtitle="Verificação de Homocedasticidade", x="Ajustado", y="Resíduo") + theme_minimal()
+  })
+  
+  output$step_qq_plot <- renderPlot({
+    req(best_step_model())
+    res <- as.numeric(resid(best_step_model()))
+    ggplot(data.frame(R=res), aes(sample=R)) + stat_qq(color="#18bc9c") + stat_qq_line() +
+      labs(title="Q-Q Plot (Normalidade)", subtitle="Os pontos devem seguir a linha") + theme_minimal()
+  })
+  
+  output$step_resid_tests <- renderPrint({
+    req(best_step_model())
+    mod <- best_step_model()
+    res <- as.numeric(resid(mod))
+    
+    cat("--- Testes de Resíduos ---\n")
+    if(length(res) < 5000) {
+      sw <- shapiro.test(res)
+      cat("Normalidade (Shapiro-Wilk): P =", format.pval(sw$p.value, digits=4), "\n")
+    }
+    
+    tryCatch({
+      ar <- pwartest(mod)
+      cat("Autocorrelação Serial (Wooldridge): P =", format.pval(ar$p.value, digits=4), "\n")
+      if(ar$p.value > 0.05) cat(">> Não rejeita H0: Sem evidência de autocorrelação (White Noise).\n")
+      else cat(">> Rejeita H0: Existe autocorrelação serial.\n")
+    }, error = function(e) cat("Não foi possível calcular teste de autocorrelação.\n"))
+  })
+  
+  # 3. LASSO (CORRIGIDO: SCALE)
+  output$method_desc <- renderText({
+    if(input$sel_method == "LASSO") return("LASSO: Zera coeficientes irrelevantes.")
+    if(input$sel_method == "Elastic Net") return("Elastic Net: Combina LASSO e Ridge.")
+    return("Stability Selection: Robustez via reamostragem.")
+  })
+  
+  lasso_results <- eventReactive(input$btn_run_lasso, {
+    req(input$lasso_dep, input$lasso_idvs)
+    
+    df_prep <- data_filtered() %>% 
+      dplyr::select(Municipio, Ano_Ref, all_of(c(input$lasso_dep, input$lasso_idvs))) %>% 
+      na.omit()
+    
+    if(input$lasso_fe) {
+      # CORRIGIDO: Use scale(center=TRUE, scale=FALSE)
+      df_prep <- df_prep %>%
+        group_by(Municipio) %>%
+        mutate(across(all_of(c(input$lasso_dep, input$lasso_idvs)), ~ scale(., scale=FALSE))) %>%
+        ungroup()
+    }
+    
+    df_model <- df_prep %>% dplyr::select(-Municipio, -Ano_Ref)
+    X <- as.matrix(df_model %>% dplyr::select(-all_of(input$lasso_dep)))
+    y <- as.vector(df_model[[input$lasso_dep]])
+    
+    vars_var <- apply(X, 2, var)
+    X <- X[, vars_var > 1e-10, drop = FALSE]
+    if(ncol(X) < 2) return(NULL)
+    
+    if(input$sel_method %in% c("LASSO", "Elastic Net")) {
+      alpha_val <- if(input$sel_method == "LASSO") 1 else input$el_alpha
+      fit <- cv.glmnet(X, y, alpha = alpha_val)
+      c_mat <- as.matrix(coef(fit, s="lambda.min"))
+      df_r <- data.frame(Variavel=rownames(c_mat), Coef=c_mat[,1]) %>% 
+        filter(Variavel != "(Intercept)", Coef != 0) %>% arrange(desc(abs(Coef)))
+      return(list(type="standard", model=fit, res=df_r))
+    } else {
+      n_iter <- input$stab_iter; n_sub <- floor(0.5 * nrow(X))
+      counts <- rep(0, ncol(X)); names(counts) <- colnames(X)
+      withProgress(message="Stability Selection...", {
+        for(i in 1:n_iter) {
+          idx <- sample(seq_len(nrow(X)), n_sub)
+          try({
+            ft <- cv.glmnet(X[idx,], y[idx], alpha=1)
+            cf <- as.matrix(coef(ft, s="lambda.min"))
+            sel <- rownames(cf)[cf[,1]!=0]
+            sel <- setdiff(sel, "(Intercept)")
+            counts[sel] <- counts[sel] + 1
+          }, silent=T)
+          incProgress(1/n_iter)
+        }
+      })
+      freqs <- counts/n_iter
+      df_s <- data.frame(Variavel=names(freqs), Freq=freqs) %>% 
+        filter(Freq >= input$stab_thresh) %>% arrange(desc(Freq))
+      return(list(type="stability", res=df_s, all_freqs=freqs, thresh=input$stab_thresh))
+    }
+  })
+  
+  output$lasso_plot <- renderPlot({
+    res <- lasso_results()
+    req(res)
+    if(res$type == "standard") {
+      par(mfrow=c(1,2)); plot(res$model); title("CV Error", line=2.5)
+      if(nrow(res$res)>0) barplot(height=sort(abs(res$res$Coef)), names.arg=res$res$Variavel[order(abs(res$res$Coef))], horiz=T, las=1, col="#2c3e50")
+      par(mfrow=c(1,1))
+    } else {
+      df_p <- data.frame(Var = names(res$all_freqs), Freq = res$all_freqs)
+      df_p$Selected <- df_p$Freq >= res$thresh
+      ggplot(df_p, aes(x=reorder(Var, Freq), y=Freq, fill=Selected)) + geom_col() + coord_flip() +
+        geom_hline(yintercept=res$thresh, linetype="dashed", color="red") +
+        scale_fill_manual(values=c("TRUE"="#18bc9c", "FALSE"="#bdc3c7")) + theme_minimal()
+    }
+  })
+  
+  output$lasso_coefs_table <- renderTable({
+    res <- lasso_results(); req(res)
+    if(res$type == "standard") res$res else res$res %>% mutate(Freq=scales::percent(Freq))
+  })
+  
+  # 4. Regressão Manual
+  output$regression_table_manual <- renderUI({
+    req(input$manual_dep, input$manual_idvs, data_filtered())
+    cols <- unique(c("Ano_Ref", input$manual_cat_fe, "Natureza_Juridica", input$manual_dep, input$manual_idvs))
+    df_base <- data_filtered() %>% dplyr::select(all_of(cols)) %>% na.omit()
+    
+    run_mod <- function(d) {
+      if(nrow(d) < 10) return(NULL)
+      pdata <- pdata.frame(d, index = c(input$manual_cat_fe, "Ano_Ref"))
+      f <- as.formula(paste(input$manual_dep, "~", paste(input$manual_idvs, collapse = "+")))
+      tryCatch(plm(f, pdata, model=switch(input$model_type_manual, "Pooling (OLS)"="pooling", "Fixed Effects (Within)"="within", "Random Effects"="random")), error=function(e) NULL)
+    }
+    
+    models <- list(Geral = run_mod(df_base))
+    for(nat in unique(df_base$Natureza_Juridica)) {
+      models[[nat]] <- run_mod(df_base %>% filter(Natureza_Juridica == nat))
+    }
+    models <- Filter(Negate(is.null), models)
+    
+    if(length(models) == 0) return(HTML("Erro na estimativa."))
+    se_list <- if(input$manual_se_type == "Clustered") lapply(models, function(m) sqrt(diag(vcovHC(m, type="HC1")))) else if(input$manual_se_type == "Driscoll-Kraay") lapply(models, function(m) tryCatch(sqrt(diag(vcovSCC(m))), error=function(e) sqrt(diag(vcovHC(m))))) else NULL
+    
+    HTML(stargazer(models, type="html", se=se_list, header=FALSE, column.labels=names(models)))
+  })
+  
+  # 5. DIAGNÓSTICOS PÓS-FE (BLINDADO)
+  output$diag_results_ui <- renderUI({
+    input$btn_run_diag
+    isolate({
+      req(input$diag_dep, input$diag_idvs)
+      
+      df <- data_filtered() %>% dplyr::select(Municipio, Ano_Ref, all_of(input$diag_dep), all_of(input$diag_idvs)) %>% na.omit()
+      if(nrow(df) < 10 || length(unique(df$Municipio)) < 2) return(div(class="alert alert-warning", "Dados insuficientes."))
+      pdata <- pdata.frame(df, index = c("Municipio", "Ano_Ref"))
+      f <- as.formula(paste(input$diag_dep, "~", paste(input$diag_idvs, collapse = "+")))
+      
+      tryCatch({
+        mod <- plm(f, pdata, model="within")
+        
+        safe_test <- function(expr) tryCatch(expr, error=function(e) list(p.value=NA), warning=function(w) list(p.value=NA))
+        ar <- safe_test(pwartest(mod))
+        bp <- safe_test(bptest(mod))
+        cd <- safe_test(pcdtest(mod))
+        
+        get_col <- function(p) if(is.na(p)) "warning" else if(p < 0.05) "danger" else "success"
+        get_txt <- function(p, type) {
+          if(is.na(p)) return("Inconclusivo (Dados Esparsos)")
+          if(p < 0.05) return(paste("Rejeita H0:", switch(type, "ar"="Autocorr.", "bp"="Heteroced.", "cd"="Dependência")))
+          return("Aceita H0 (OK)")
+        }
+        
+        rec_text <- "Modelo FE padrão parece adequado."
+        if((!is.na(ar$p.value) && ar$p.value < 0.05) || (!is.na(bp$p.value) && bp$p.value < 0.05)) rec_text <- "Sugerido: Erros Padrão Robustos Clusterizados (vcovHC)."
+        if(!is.na(cd$p.value) && cd$p.value < 0.05) rec_text <- "Sugerido: Estimador de Driscoll-Kraay (vcovSCC)."
+        if(is.na(cd$p.value)) rec_text <- paste(rec_text, "(Aviso: Testes de dependência falharam por falta de dados cruzados).")
+        
+        fluidRow(
+          column(4, div(class=paste0("card text-white bg-", get_col(bp$p.value), " mb-3"),
+                        div(class="card-header", "Heterocedasticidade"),
+                        div(class="card-body", h5("Breusch-Pagan"), p(fmt_pval(bp$p.value)), tags$small(get_txt(bp$p.value, "bp"))))),
+          column(4, div(class=paste0("card text-white bg-", get_col(cd$p.value), " mb-3"),
+                        div(class="card-header", "Dependência Seccional"),
+                        div(class="card-body", h5("Pesaran CD"), p(fmt_pval(cd$p.value)), tags$small(get_txt(cd$p.value, "cd"))))),
+          column(4, div(class=paste0("card text-white bg-", get_col(ar$p.value), " mb-3"),
+                        div(class="card-header", "Autocorrelação"),
+                        div(class="card-body", h5("Wooldridge AR(1)"), p(fmt_pval(ar$p.value)), tags$small(get_txt(ar$p.value, "ar"))))),
+          column(12, div(class="alert alert-info", style="text-align: center; font-weight: bold;", paste("Recomendação Final:", rec_text)))
+        )
+      }, error = function(e) div(class="alert alert-danger", e$message))
+    })
+  })
+  
+  # 6. VIF (CORRIGIDO: COM MODELO REAL)
+  output$vif_result_table <- renderTable({
+    input$btn_calc_vif
+    isolate({
+      req(input$vif_idvs, input$manual_dep) # Usa dep da regressão manual como referência
+      
+      # Usa a variável dependente da aba de regressão manual para consistência
+      dep_var <- if(!is.null(input$manual_dep)) input$manual_dep else names(values$raw_df)[grepl("es001", names(values$raw_df), ignore.case=T)][1]
+      
+      df <- data_filtered() %>% dplyr::select(all_of(c(dep_var, input$vif_idvs))) %>% na.omit()
+      
+      # Se for painel, idealmente centramos, mas para VIF simples OLS basta
+      # VIF mede colinearidade entre X, independente de Y, mas precisa da estrutura do modelo
+      model_vif <- lm(as.formula(paste(dep_var, "~", paste(input$vif_idvs, collapse="+"))), data=df)
+      
+      tryCatch({
+        v <- car::vif(model_vif)
+        if(!is.null(dim(v))) v <- v[,1] # Se tiver GVIF, pega a primeira coluna
+        data.frame(Variavel=names(v), VIF=v)
+      }, error = function(e) data.frame(Erro="Colinearidade Perfeita ou Dados Insuficientes"))
+    })
   })
 }
 
