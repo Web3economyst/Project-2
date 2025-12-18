@@ -74,13 +74,12 @@ cor_pvalue_matrix <- function(mat) {
   return(p.mat)
 }
 
-# Cálculo CORRETO de AIC para Painel (Considerando N efeitos fixos)
+# Cálculo CORRETO de AIC para Painel
 get_plm_info <- function(plm_model) {
   rss <- sum(residuals(plm_model)^2)
   n <- length(residuals(plm_model))
   k <- length(coef(plm_model))
   
-  # Ajuste de graus de liberdade para FE (Within)
   args <- attr(plm_model, "args")
   if (!is.null(args$model) && args$model == "within") {
     n_entities <- length(unique(index(plm_model)[[1]]))
@@ -89,7 +88,6 @@ get_plm_info <- function(plm_model) {
     k_eff <- k
   }
   
-  # Evita log de zero ou negativo
   if (rss <= 0) return(c(AIC = NA, BIC = NA))
   
   aic_val <- n * log(rss / n) + 2 * k_eff
@@ -214,7 +212,7 @@ ui <- page_sidebar(
              br(),
              tabsetPanel(
                
-               # SEÇÃO 1: TESTES DE PAINEL (CORRIGIDO)
+               # SEÇÃO 1: TESTES DE PAINEL
                tabPanel("Testes de Painel (F & Hausman)", 
                         br(),
                         sidebarLayout(
@@ -228,13 +226,13 @@ ui <- page_sidebar(
                           ),
                           mainPanel(
                             h3("Resultados de Especificação"),
-                            p("Roteiro de decisão: Pooling vs Random Effects vs Fixed Effects."),
+                            p("Estes testes ajudam a decidir entre OLS, Efeitos Fixos ou Aleatórios."),
                             uiOutput("spec_tests_results_ui")
                           )
                         )
                ),
                
-               # SEÇÃO 2: SELEÇÃO DO MODELO (COM TRANSFORMACAO WITHIN + STEPWISE OLS)
+               # SEÇÃO 2: SELEÇÃO DO MODELO (STEPWISE COM ERRO ROBUSTO)
                tabPanel("Seleção do Modelo", 
                         br(),
                         sidebarLayout(
@@ -246,25 +244,35 @@ ui <- page_sidebar(
                             selectInput("step_dep", "Dependente (Y):", choices = NULL),
                             selectInput("step_idvs", "Candidatas (X):", choices = NULL, multiple = TRUE),
                             hr(),
+                            div(class = "alert alert-warning",
+                                p(strong("Atenção:"), "A seleção usa AIC. Para significância real, observe o quadro 'Ajuste Robusto'."),
+                                tags$ul(
+                                  tags$li("Transformação within aplicada"),
+                                  tags$li("Critério: Seleção por AIC"),
+                                  tags$li("Diagnóstico Pós-Seleção com Erros Clusterizados")
+                                )
+                            ),
                             actionButton("btn_run_stepwise_adv", "Executar Stepwise", class = "btn-success", width = "100%")
                           ),
                           mainPanel(
                             h3("Comparação de Métodos de Seleção"),
-                            div(class="alert alert-info", "Nota: Para 'Fixed Effects', o algoritmo aplica a transformação within (centragem na média) antes da seleção para garantir consistência."),
+                            div(class="alert alert-info", "O Stepwise seleciona variáveis pelo menor AIC. Abaixo, validamos essa seleção com Erros Padrão Clusterizados para corrigir a inflação de significância."),
                             DT::dataTableOutput("stepwise_results_table"),
                             br(),
-                            uiOutput("stepwise_best_header_ui"),
+                            
+                            h4("Diagnóstico de Robustez (Pós-Seleção)"),
+                            p("Teste conjunto e individual usando erros robustos (HAC) para evitar falsos positivos."),
+                            verbatimTextOutput("robustness_diag"),
+                            
+                            h4("Resumo do Modelo Vencedor (Detalhado)"),
                             verbatimTextOutput("stepwise_best_summary"),
                             
-                            # DIAGNOSTICO RESIDUOS
                             hr(),
-                            h4("Diagnóstico de Resíduos (White Noise Check)"),
-                            p("Análise dos resíduos do modelo vencedor."),
+                            h4("Diagnóstico de Resíduos"),
                             fluidRow(
                               column(6, plotOutput("step_resid_plot", height = "300px")),
                               column(6, plotOutput("step_qq_plot", height = "300px"))
                             ),
-                            br(),
                             verbatimTextOutput("step_resid_tests")
                           )
                         )
@@ -337,7 +345,7 @@ ui <- page_sidebar(
                         )
                ),
                
-               # SEÇÃO 5: DIAGNÓSTICOS PÓS-FE (BLINDADO)
+               # SEÇÃO 5: DIAGNÓSTICOS PÓS-FE
                tabPanel("Diagnósticos (Pós-FE)",
                         br(),
                         sidebarLayout(
@@ -357,7 +365,7 @@ ui <- page_sidebar(
                         )
                ),
                
-               # SEÇÃO 6: VIF (CORRIGIDO)
+               # SEÇÃO 6: VIF
                tabPanel("Teste VIF",
                         sidebarLayout(
                           sidebarPanel(
@@ -367,7 +375,7 @@ ui <- page_sidebar(
                           ),
                           mainPanel(
                             h3("Fatores de Inflação da Variância (VIF)"),
-                            p("Detecta multicolinearidade. VIF > 5 ou 10 indica problema."),
+                            verbatimTextOutput("vif_diagnosis"),
                             fluidRow(
                               column(6, tableOutput("vif_result_table")),
                               column(6, plotOutput("vif_plot"))
@@ -408,7 +416,6 @@ server <- function(input, output, session) {
     cols_skip <- c("Municipio", "Sigla_UF", "Natureza_Juridica", "prestador", "sigla_do_prestador")
     for(col in setdiff(names(clean), cols_skip)) if(is.character(clean[[col]])) clean[[col]] <- sapply(clean[[col]], clean_pt_num)
     
-    # Cálculos automáticos
     c2 <- names(clean)[grepl("^fn002", names(clean))][1]
     c15 <- names(clean)[grepl("^fn015", names(clean))][1]
     if(!is.na(c2) && !is.na(c15)) clean$Lucro_op <- clean[[c2]] - clean[[c15]]
@@ -578,7 +585,7 @@ server <- function(input, output, session) {
   
   # --- OUTPUTS TAB 4 ---
   
-  # 1. Testes de Painel (CORRIGIDO: Hausman RE vs FE)
+  # 1. Testes de Painel
   output$spec_tests_results_ui <- renderUI({
     input$btn_run_spec
     isolate({
@@ -596,7 +603,7 @@ server <- function(input, output, session) {
         mod_pool <- plm(form, data = pdata, model = "pooling")
         
         f_t <- pFtest(mod_fe, mod_pool)
-        h_t <- phtest(mod_re, mod_fe) # CORRIGIDO: RE vs FE
+        h_t <- phtest(mod_re, mod_fe)
         
         tagList(
           h4("Teste F (Pooled vs FE)"), p(paste("P-valor:", fmt_pval(f_t$p.value))),
@@ -605,11 +612,17 @@ server <- function(input, output, session) {
           h4("Teste Hausman (RE vs FE)"), p(paste("P-valor:", fmt_pval(h_t$p.value))),
           p(if(h_t$p.value < 0.05) "Rejeita H0 (RE Inconsistente): Use Efeitos Fixos (Within)." else "Não Rejeita H0: Use Efeitos Aleatórios (Eficiente).")
         )
-      }, error = function(e) div(class="alert alert-danger", paste("Erro:", e$message)))
+      }, error = function(e) {
+        if(grepl("singular", e$message)) {
+          div(class="alert alert-danger", "Erro: Matriz singular. Isso ocorre quando variáveis são redundantes (colinearidade perfeita). Remova variáveis que sejam combinação linear de outras.")
+        } else {
+          div(class="alert alert-danger", paste("Erro:", e$message))
+        }
+      })
     })
   })
   
-  # 2. Seleção do Modelo (Stepwise - COM LOGICA WITHIN)
+  # 2. SELEÇÃO DO MODELO (STEPWISE - COM LOGICA CORRETA)
   observeEvent(input$btn_run_stepwise_adv, {
     req(input$step_dep, input$step_idvs)
     
@@ -617,17 +630,24 @@ server <- function(input, output, session) {
       dplyr::select(Municipio, Ano_Ref, all_of(input$step_dep), all_of(input$step_idvs)) %>%
       na.omit()
     
-    # TRATAMENTO DE WITHIN (DEMEANING) ANTES DO STEPWISE
-    if (input$step_model_type == "within") {
+    if(nrow(df) < 30) {
+      showNotification("Amostra muito pequena (n < 30).", type = "warning")
+      return(NULL)
+    }
+    if(length(unique(df$Municipio)) < 5) {
+      showNotification("Número insuficiente de grupos para painel.", type = "warning")
+      return(NULL)
+    }
+    
+    if(input$step_model_type == "within") {
       df_step <- df %>%
         group_by(Municipio) %>%
-        mutate(across(all_of(c(input$step_dep, input$step_idvs)), ~ scale(., scale = FALSE))) %>%
+        mutate(across(all_of(c(input$step_dep, input$step_idvs)), ~ . - mean(., na.rm = TRUE))) %>%
         ungroup()
     } else {
       df_step <- df
     }
     
-    # Modelos OLS para Stepwise
     null_model <- lm(as.formula(paste(input$step_dep, "~ 1")), data = df_step)
     full_model <- lm(as.formula(paste(input$step_dep, "~", paste(input$step_idvs, collapse = "+"))), data = df_step)
     
@@ -637,7 +657,6 @@ server <- function(input, output, session) {
     best_mod <- NULL
     best_name <- ""
     
-    # Dados para painel final
     pdata <- pdata.frame(df, index = c("Municipio", "Ano_Ref"))
     
     withProgress(message = "Calculando Stepwise...", {
@@ -645,7 +664,6 @@ server <- function(input, output, session) {
         incProgress(1/3, detail = dir)
         
         start_mod <- if (dir == "forward") null_model else full_model
-        
         step_res <- stepAIC(start_mod, scope = list(lower = null_model, upper = full_model), direction = dir, trace = FALSE)
         
         final_vars <- names(coef(step_res))[-1]
@@ -653,7 +671,6 @@ server <- function(input, output, session) {
         
         final_form <- as.formula(paste(input$step_dep, "~", paste(final_vars, collapse = "+")))
         
-        # Estima modelo final correto
         mod_p <- tryCatch(
           plm(final_form, data = pdata, model = input$step_model_type),
           error = function(e) NULL
@@ -682,6 +699,42 @@ server <- function(input, output, session) {
       step_results_data(do.call(rbind, results_list))
       best_step_model(best_mod)
       best_method_name(best_name)
+      
+      tryCatch({
+        vcov_mat <- tryCatch(vcovHC(best_mod, type="HC1", cluster="group"), error=function(e) NULL)
+        msg_err <- " (Matriz HAC clusterizada por grupo)"
+        if(is.null(vcov_mat)) {
+          vcov_mat <- vcov(best_mod)
+          msg_err <- " (Matriz singular: usando erros padrão simples - Cuidado com inferência)"
+        }
+        
+        ct <- coeftest(best_mod, vcov=vcov_mat)
+        sig_vars <- rownames(ct)[ct[,4] < 0.05]
+        
+        vars_names <- names(coef(best_mod))
+        p_joint <- NA
+        if(length(vars_names) > 0) {
+          try({
+            lh <- car::linearHypothesis(best_mod, vars_names, vcov.=vcov_mat)
+            p_joint <- lh[2, "Pr(>Chisq)"]
+          }, silent=TRUE)
+        }
+        
+        output$robustness_diag <- renderPrint({
+          cat("=== DIAGNÓSTICO DE ROBUSTEZ (Pós-Seleção) ===\n")
+          cat("Método de Erro Padrão:", msg_err, "\n")
+          cat("Variáveis selecionadas:", length(vars_names), "\n")
+          cat("Variáveis significativas (p < 0.05):", length(sig_vars), "\n")
+          
+          if(!is.na(p_joint)) {
+            cat("Teste Conjunto (Wald) P-valor:", format.pval(p_joint, digits=4), "\n")
+            if(p_joint < 0.05) cat("→ Modelo conjunto é significativo (OK)\n")
+            else cat("→ ATENÇÃO: Modelo pode não ser estatisticamente significativo.\n")
+          } else {
+            cat("Teste conjunto não pôde ser calculado (possível singularidade).\n")
+          }
+        })
+      }, error=function(e) output$robustness_diag <- renderPrint(paste("Erro no diagnóstico:", e$message)))
     }
   })
   
@@ -693,9 +746,24 @@ server <- function(input, output, session) {
         paste("MODELO VENCEDOR: ", toupper(best_method_name())))
   })
   
-  output$stepwise_best_summary <- renderPrint({ req(best_step_model()); summary(best_step_model()) })
+  # --- AJUSTE: RESUMO COM ERROS ROBUSTOS ---
+  output$stepwise_best_summary <- renderPrint({ 
+    req(best_step_model())
+    
+    cat("--- Resumo Padrão (Sem Correção de Painel) ---\n")
+    print(summary(best_step_model()))
+    
+    cat("\n\n--- AJUSTE ROBUSTO (Clusterizado por Município) ---\n")
+    cat("Nota: Este teste corrige a inflação de significância causada pela autocorrelação.\n")
+    
+    tryCatch({
+      # Tenta clusterizar
+      coeftest(best_step_model(), vcov=vcovHC(best_step_model(), type="HC1", cluster="group"))
+    }, error=function(e) {
+      cat("Não foi possível calcular o erro robusto (possível singularidade ou poucos graus de liberdade).")
+    })
+  })
   
-  # --- OUTPUTS DE RESÍDUOS PARA STEPWISE ---
   output$step_resid_plot <- renderPlot({
     req(best_step_model())
     mod <- best_step_model()
@@ -732,9 +800,9 @@ server <- function(input, output, session) {
     }, error = function(e) cat("Não foi possível calcular teste de autocorrelação.\n"))
   })
   
-  # 3. LASSO (CORRIGIDO: SCALE)
+  # 3. LASSO
   output$method_desc <- renderText({
-    if(input$sel_method == "LASSO") return("LASSO: Zera coeficientes irrelevantes.")
+    if(input$sel_method == "LASSO") return("LASSO: Zera coeficientes irrelevantes (Usa lambda.1se para evitar overfitting).")
     if(input$sel_method == "Elastic Net") return("Elastic Net: Combina LASSO e Ridge.")
     return("Stability Selection: Robustez via reamostragem.")
   })
@@ -746,8 +814,12 @@ server <- function(input, output, session) {
       dplyr::select(Municipio, Ano_Ref, all_of(c(input$lasso_dep, input$lasso_idvs))) %>% 
       na.omit()
     
+    if(nrow(df_prep) < 50) {
+      showNotification("Amostra muito pequena para LASSO (< 50).", type = "warning")
+      return(NULL)
+    }
+    
     if(input$lasso_fe) {
-      # CORRIGIDO: Use scale(center=TRUE, scale=FALSE)
       df_prep <- df_prep %>%
         group_by(Municipio) %>%
         mutate(across(all_of(c(input$lasso_dep, input$lasso_idvs)), ~ scale(., scale=FALSE))) %>%
@@ -758,14 +830,19 @@ server <- function(input, output, session) {
     X <- as.matrix(df_model %>% dplyr::select(-all_of(input$lasso_dep)))
     y <- as.vector(df_model[[input$lasso_dep]])
     
-    vars_var <- apply(X, 2, var)
-    X <- X[, vars_var > 1e-10, drop = FALSE]
-    if(ncol(X) < 2) return(NULL)
+    vars_var <- apply(X, 2, var, na.rm=TRUE)
+    X <- X[, vars_var > quantile(vars_var, 0.1), drop = FALSE]
+    if(ncol(X) < 2) {
+      showNotification("Muitas variáveis constantes ou sem variância.", type="warning")
+      return(NULL)
+    }
+    
+    X_scaled <- scale(X)
     
     if(input$sel_method %in% c("LASSO", "Elastic Net")) {
       alpha_val <- if(input$sel_method == "LASSO") 1 else input$el_alpha
-      fit <- cv.glmnet(X, y, alpha = alpha_val)
-      c_mat <- as.matrix(coef(fit, s="lambda.min"))
+      fit <- cv.glmnet(X_scaled, y, alpha = alpha_val, nfolds=10)
+      c_mat <- as.matrix(coef(fit, s="lambda.1se"))
       df_r <- data.frame(Variavel=rownames(c_mat), Coef=c_mat[,1]) %>% 
         filter(Variavel != "(Intercept)", Coef != 0) %>% arrange(desc(abs(Coef)))
       return(list(type="standard", model=fit, res=df_r))
@@ -776,7 +853,7 @@ server <- function(input, output, session) {
         for(i in 1:n_iter) {
           idx <- sample(seq_len(nrow(X)), n_sub)
           try({
-            ft <- cv.glmnet(X[idx,], y[idx], alpha=1)
+            ft <- cv.glmnet(X_scaled[idx,], y[idx], alpha=1)
             cf <- as.matrix(coef(ft, s="lambda.min"))
             sel <- rownames(cf)[cf[,1]!=0]
             sel <- setdiff(sel, "(Intercept)")
@@ -796,7 +873,7 @@ server <- function(input, output, session) {
     res <- lasso_results()
     req(res)
     if(res$type == "standard") {
-      par(mfrow=c(1,2)); plot(res$model); title("CV Error", line=2.5)
+      par(mfrow=c(1,2)); plot(res$model); title("CV Error (Lambda.1se)", line=2.5)
       if(nrow(res$res)>0) barplot(height=sort(abs(res$res$Coef)), names.arg=res$res$Variavel[order(abs(res$res$Coef))], horiz=T, las=1, col="#2c3e50")
       par(mfrow=c(1,1))
     } else {
@@ -813,7 +890,7 @@ server <- function(input, output, session) {
     if(res$type == "standard") res$res else res$res %>% mutate(Freq=scales::percent(Freq))
   })
   
-  # 4. Regressão Manual
+  # 4. Regressão Manual (COM FALLBACK PARA SINGULARIDADE)
   output$regression_table_manual <- renderUI({
     req(input$manual_dep, input$manual_idvs, data_filtered())
     cols <- unique(c("Ano_Ref", input$manual_cat_fe, "Natureza_Juridica", input$manual_dep, input$manual_idvs))
@@ -833,9 +910,27 @@ server <- function(input, output, session) {
     models <- Filter(Negate(is.null), models)
     
     if(length(models) == 0) return(HTML("Erro na estimativa."))
-    se_list <- if(input$manual_se_type == "Clustered") lapply(models, function(m) sqrt(diag(vcovHC(m, type="HC1")))) else if(input$manual_se_type == "Driscoll-Kraay") lapply(models, function(m) tryCatch(sqrt(diag(vcovSCC(m))), error=function(e) sqrt(diag(vcovHC(m))))) else NULL
     
-    HTML(stargazer(models, type="html", se=se_list, header=FALSE, column.labels=names(models)))
+    get_robust_se <- function(m) {
+      if(input$manual_se_type == "Standard") return(NULL)
+      
+      se <- tryCatch({
+        if(input$manual_se_type == "Clustered") sqrt(diag(vcovHC(m, type="HC1")))
+        else if(input$manual_se_type == "Driscoll-Kraay") sqrt(diag(vcovSCC(m)))
+        else NULL
+      }, error = function(e) return(NULL))
+      
+      return(se)
+    }
+    
+    se_list <- lapply(models, get_robust_se)
+    
+    note_txt <- paste("Erro Padrão:", input$manual_se_type)
+    if(any(sapply(se_list, is.null)) && input$manual_se_type != "Standard") {
+      note_txt <- paste(note_txt, "(Alguns modelos usaram erro padrão simples devido à singularidade).")
+    }
+    
+    HTML(stargazer(models, type="html", se=se_list, header=FALSE, column.labels=names(models), notes=note_txt, notes.append=TRUE))
   })
   
   # 5. DIAGNÓSTICOS PÓS-FE (BLINDADO)
@@ -859,7 +954,7 @@ server <- function(input, output, session) {
         
         get_col <- function(p) if(is.na(p)) "warning" else if(p < 0.05) "danger" else "success"
         get_txt <- function(p, type) {
-          if(is.na(p)) return("Inconclusivo (Dados Esparsos)")
+          if(is.na(p)) return("Inconclusivo")
           if(p < 0.05) return(paste("Rejeita H0:", switch(type, "ar"="Autocorr.", "bp"="Heteroced.", "cd"="Dependência")))
           return("Aceita H0 (OK)")
         }
@@ -885,26 +980,48 @@ server <- function(input, output, session) {
     })
   })
   
-  # 6. VIF (CORRIGIDO: COM MODELO REAL)
+  # 6. VIF (CORRIGIDO)
+  output$vif_diagnosis <- renderText({
+    req(input$vif_idvs)
+    dep_var <- if(!is.null(input$manual_dep)) input$manual_dep else names(values$raw_df)[grepl("es001", names(values$raw_df), ignore.case=T)][1]
+    
+    df <- data_filtered() %>% dplyr::select(all_of(c(dep_var, input$vif_idvs))) %>% na.omit()
+    
+    if(nrow(df) < length(input$vif_idvs)) return("Dados insuficientes para cálculo do VIF.")
+    
+    # Verifica alias (colinearidade perfeita)
+    model_vif <- lm(as.formula(paste(dep_var, "~", paste(input$vif_idvs, collapse = "+"))), data = df)
+    
+    if(any(is.na(coef(model_vif)))) return("ERRO: Colinearidade Perfeita (Aliasing). Remova variáveis redundantes.")
+    
+    tryCatch({
+      vif_vals <- car::vif(model_vif)
+      if(is.matrix(vif_vals)) vif_vals <- vif_vals[,1] # Handle GVIF
+      
+      if(any(vif_vals > 10)) {
+        high <- names(vif_vals)[vif_vals > 10]
+        paste("ALERTA: Multicolinearidade crítica detectada (>10) em:", paste(high, collapse=", "))
+      } else if(any(vif_vals > 5)) {
+        med <- names(vif_vals)[vif_vals > 5]
+        paste("AVISO: Multicolinearidade moderada (>5) em:", paste(med, collapse=", "))
+      } else {
+        "Diagnóstico VIF: Multicolinearidade sob controle (Todos < 5)."
+      }
+    }, error = function(e) "Erro no cálculo do VIF.")
+  })
+  
   output$vif_result_table <- renderTable({
     input$btn_calc_vif
     isolate({
-      req(input$vif_idvs, input$manual_dep) # Usa dep da regressão manual como referência
-      
-      # Usa a variável dependente da aba de regressão manual para consistência
+      req(input$vif_idvs)
       dep_var <- if(!is.null(input$manual_dep)) input$manual_dep else names(values$raw_df)[grepl("es001", names(values$raw_df), ignore.case=T)][1]
       
       df <- data_filtered() %>% dplyr::select(all_of(c(dep_var, input$vif_idvs))) %>% na.omit()
+      model_vif <- lm(as.formula(paste(dep_var, "~", paste(input$vif_idvs, collapse = "+"))), data = df)
       
-      # Se for painel, idealmente centramos, mas para VIF simples OLS basta
-      # VIF mede colinearidade entre X, independente de Y, mas precisa da estrutura do modelo
-      model_vif <- lm(as.formula(paste(dep_var, "~", paste(input$vif_idvs, collapse="+"))), data=df)
-      
-      tryCatch({
-        v <- car::vif(model_vif)
-        if(!is.null(dim(v))) v <- v[,1] # Se tiver GVIF, pega a primeira coluna
-        data.frame(Variavel=names(v), VIF=v)
-      }, error = function(e) data.frame(Erro="Colinearidade Perfeita ou Dados Insuficientes"))
+      v <- car::vif(model_vif)
+      if(is.matrix(v)) v <- v[,1]
+      data.frame(Variavel=names(v), VIF=v)
     })
   })
 }
